@@ -1,0 +1,23 @@
+services:
+  dev2-chat:
+    build: .
+    container_name: dev2-chat
+    ports:
+      - "8081:8080"
+    env_file: .env
+    environment:
+      MONGO_URI: mongodb://${MONGO_USER:-root}:${MONGO_PASSWORD:-dev2}@mongodb:27017/${MONGO_DATABASE:-dev2knowledge}?authSource=${MONGO_AUTH_SOURCE:-admin}
+      NATS_URL: nats://nats:4223
+    networks:
+      - dev2-network
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "wget", "--no-verbose", "--tries=1", "--spider", "http://localhost:8080/health"]
+      interval: 15s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
+
+networks:
+  dev2-network:
+    external: true
