@@ -103,6 +103,8 @@ type ToolTraceEvent struct {
 	EventID          string `bson:"eventId" json:"eventId"`
 	Type             string `bson:"type" json:"type"`
 	SessionID        string `bson:"sessionId" json:"sessionId"`
+	SpanID           string `bson:"spanId,omitempty" json:"spanId,omitempty"`
+	ParentSpanID     string `bson:"parentSpanId,omitempty" json:"parentSpanId,omitempty"`
 	ToolCallID       string `bson:"toolCallId,omitempty" json:"toolCallId,omitempty"`
 	ParentToolCallID string `bson:"parentToolCallId,omitempty" json:"parentToolCallId,omitempty"`
 	ToolName         string `bson:"toolName,omitempty" json:"toolName,omitempty"`

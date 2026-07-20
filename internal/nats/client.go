@@ -108,6 +108,7 @@ func (c *Client) RequestLLMWithProgress(ctx context.Context, req *models.LLMRequ
 	}
 
 	progressSubject := nats.NewInbox()
+	cancelSubject := nats.NewInbox()
 	progressMessages := make(chan *nats.Msg, 64)
 	progressSub, err := c.nc.ChanSubscribe(progressSubject, progressMessages)
 	if err != nil {
@@ -131,6 +132,7 @@ func (c *Client) RequestLLMWithProgress(ctx context.Context, req *models.LLMRequ
 		"workspaceCompanyId":  req.WorkspaceCompanyID,
 		"workspaceProjectId":  req.WorkspaceProjectID,
 		"progressSubject":     progressSubject,
+		"cancelSubject":       cancelSubject,
 	}
 	// Forward the session's access profile and workspace scoping so
 	// dev2-llm-service can gate its own tools and resolve personas.
@@ -154,6 +156,16 @@ func (c *Client) RequestLLMWithProgress(ctx context.Context, req *models.LLMRequ
 		msg, requestErr := c.nc.RequestWithContext(requestCtx, fmt.Sprintf("%s.%s", SubjectLLMRequest, sessionID), payload)
 		resultCh <- requestResult{msg: msg, err: requestErr}
 	}()
+	cancelPublished := false
+	publishCancel := func() {
+		if cancelPublished {
+			return
+		}
+		cancelPublished = true
+		if err := c.nc.Publish(cancelSubject, []byte(`{}`)); err != nil {
+			log.Printf("[nats] Failed to publish llm cancellation: %v", err)
+		}
+	}
 
 	forwardProgress := func(msg *nats.Msg) {
 		if onProgress == nil {
@@ -180,6 +192,9 @@ func (c *Client) RequestLLMWithProgress(ctx context.Context, req *models.LLMRequ
 					forwardProgress(msg)
 				default:
 					if result.err != nil {
+						if ctx.Err() != nil || requestCtx.Err() != nil {
+							publishCancel()
+						}
 						return nil, fmt.Errorf("llm.request failed: %w", result.err)
 					}
 					var resp models.LLMResponse
@@ -190,6 +205,7 @@ func (c *Client) RequestLLMWithProgress(ctx context.Context, req *models.LLMRequ
 				}
 			}
 		case <-requestCtx.Done():
+			publishCancel()
 			return nil, fmt.Errorf("llm.request failed: %w", requestCtx.Err())
 		}
 	}

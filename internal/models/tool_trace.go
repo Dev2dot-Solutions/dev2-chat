@@ -1,17 +1,20 @@
 package models
 
-import "strings"
+import (
+	"strconv"
+	"strings"
+)
 
 // NormalizeToolTrace removes request-level noise and folds lifecycle updates
 // for the same tool/delegation into one final persisted entry. Input order is
-// retained according to the first event for each tool call.
+// retained according to the first event for each lifecycle span.
 func NormalizeToolTrace(events []ToolTraceEvent) []ToolTraceEvent {
 	var normalized []ToolTraceEvent
-	byToolCallID := make(map[string]int)
+	byLifecycle := make(map[string]int)
 	seenEventID := make(map[string]struct{})
 
 	for _, event := range events {
-		if !isPersistableTraceEvent(event) {
+		if !IsToolTraceEvent(event) {
 			continue
 		}
 		if event.EventID != "" {
@@ -21,15 +24,12 @@ func NormalizeToolTrace(events []ToolTraceEvent) []ToolTraceEvent {
 			seenEventID[event.EventID] = struct{}{}
 		}
 
-		if event.ToolCallID == "" {
-			normalized = append(normalized, event)
-			continue
-		}
-		if index, ok := byToolCallID[event.ToolCallID]; ok {
+		key := traceLifecycleKey(event)
+		if index, ok := byLifecycle[key]; ok {
 			normalized[index] = mergeToolTraceEvent(normalized[index], event)
 			continue
 		}
-		byToolCallID[event.ToolCallID] = len(normalized)
+		byLifecycle[key] = len(normalized)
 		normalized = append(normalized, event)
 	}
 
@@ -41,14 +41,43 @@ func isRequestTraceEvent(eventType string) bool {
 	return strings.HasPrefix(normalized, "request_")
 }
 
-func isPersistableTraceEvent(event ToolTraceEvent) bool {
+// IsToolTraceEvent reports whether an event represents tool or delegation
+// activity suitable for display and persistence. Request/model lifecycle noise
+// is intentionally excluded.
+func IsToolTraceEvent(event ToolTraceEvent) bool {
 	if isRequestTraceEvent(event.Type) {
 		return false
 	}
 	eventType := strings.ToLower(event.Type)
-	return event.ToolCallID != "" || event.ParentToolCallID != "" ||
-		event.ToolName != "" || event.PersonaName != "" ||
-		strings.Contains(eventType, "tool") || strings.Contains(eventType, "delegat")
+	return strings.Contains(eventType, "tool") || strings.Contains(eventType, "delegat")
+}
+
+func traceLifecycleKey(event ToolTraceEvent) string {
+	if event.SpanID != "" {
+		return "span:" + event.SpanID
+	}
+
+	// Older emitters lack spans. The lifecycle family removes started/completed
+	// state while the remaining stable attribution fields avoid merging
+	// unrelated tools or nested delegations where possible.
+	return strings.Join([]string{
+		"legacy", traceEventFamily(event.Type), event.ToolCallID,
+		event.ParentSpanID, event.ParentToolCallID, strconv.Itoa(event.DelegationDepth),
+	}, "|")
+}
+
+func traceEventFamily(eventType string) string {
+	normalized := strings.ReplaceAll(strings.ToLower(eventType), "-", "_")
+	switch {
+	case strings.Contains(normalized, "delegat"):
+		return "delegation"
+	case strings.Contains(normalized, "tool"):
+		return "tool"
+	}
+	for _, suffix := range []string{"_started", "_completed", "_failed", "_cancelled", "_canceled"} {
+		normalized = strings.TrimSuffix(normalized, suffix)
+	}
+	return normalized
 }
 
 func mergeToolTraceEvent(current, update ToolTraceEvent) ToolTraceEvent {
@@ -60,6 +89,15 @@ func mergeToolTraceEvent(current, update ToolTraceEvent) ToolTraceEvent {
 	}
 	if update.SessionID != "" {
 		current.SessionID = update.SessionID
+	}
+	if update.SpanID != "" {
+		current.SpanID = update.SpanID
+	}
+	if update.ParentSpanID != "" {
+		current.ParentSpanID = update.ParentSpanID
+	}
+	if update.ToolCallID != "" {
+		current.ToolCallID = update.ToolCallID
 	}
 	if update.ParentToolCallID != "" {
 		current.ParentToolCallID = update.ParentToolCallID

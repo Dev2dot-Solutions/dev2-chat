@@ -464,6 +464,9 @@ func (h *AgentHandler) streamAnswer(w http.ResponseWriter, r *http.Request, sess
 	resultCh := make(chan agentResult, 1)
 	go func() {
 		result := h.processLLMResponse(r, session, llmReq, req, profile, project, func(event models.ToolTraceEvent) {
+			if !models.IsToolTraceEvent(event) {
+				return
+			}
 			select {
 			case progressCh <- event:
 			case <-r.Context().Done():
@@ -506,13 +509,7 @@ func (h *AgentHandler) streamAnswer(w http.ResponseWriter, r *http.Request, sess
 					return
 				}
 			}
-			if err := writeSSEJSON(w, flusher, "meta", models.ChatResponse{
-				ConversationID:   session.ID,
-				ToolCalls:        result.toolCalls,
-				ToolTrace:        toolTrace,
-				PendingApprovals: result.pendingApprovals,
-				Sources:          sources,
-			}); err != nil {
+			if err := writeSSEJSON(w, flusher, "meta", buildStreamMeta(session.ID, result, toolTrace, sources)); err != nil {
 				return
 			}
 			if _, err := fmt.Fprint(w, "event: done\ndata: [DONE]\n\n"); err != nil {
@@ -523,6 +520,17 @@ func (h *AgentHandler) streamAnswer(w http.ResponseWriter, r *http.Request, sess
 		case <-r.Context().Done():
 			return
 		}
+	}
+}
+
+func buildStreamMeta(sessionID string, result agentResult, toolTrace []models.ToolTraceEvent, sources []models.Source) models.ChatResponse {
+	return models.ChatResponse{
+		Answer:           result.answer,
+		ConversationID:   sessionID,
+		ToolCalls:        result.toolCalls,
+		ToolTrace:        toolTrace,
+		PendingApprovals: result.pendingApprovals,
+		Sources:          sources,
 	}
 }
 
