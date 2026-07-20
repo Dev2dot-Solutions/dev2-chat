@@ -1,6 +1,7 @@
 package nats
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"log"
@@ -66,7 +67,15 @@ func (c *Client) RequestKnowledgeSearch(req *models.KnowledgeSearchRequest) (*mo
 
 // RequestLLM sends a NATS request-reply to dev2-llm-service for completion.
 func (c *Client) RequestLLM(req *models.LLMRequest) (*models.LLMResponse, error) {
-	if c.enc == nil {
+	return c.RequestLLMWithProgress(context.Background(), req, nil)
+}
+
+// RequestLLMWithProgress sends an LLM request while forwarding safe progress
+// metadata from a unique inbox. The progress subscription is active before
+// the request is published and is always removed when the final reply,
+// cancellation, or timeout is observed.
+func (c *Client) RequestLLMWithProgress(ctx context.Context, req *models.LLMRequest, onProgress func(models.ToolTraceEvent)) (*models.LLMResponse, error) {
+	if c.nc == nil {
 		return nil, fmt.Errorf("NATS not connected")
 	}
 	sessionID := req.SessionID
@@ -98,6 +107,19 @@ func (c *Client) RequestLLM(req *models.LLMRequest) (*models.LLMResponse, error)
 		}
 	}
 
+	progressSubject := nats.NewInbox()
+	progressMessages := make(chan *nats.Msg, 64)
+	progressSub, err := c.nc.ChanSubscribe(progressSubject, progressMessages)
+	if err != nil {
+		return nil, fmt.Errorf("subscribe to llm progress: %w", err)
+	}
+	defer progressSub.Unsubscribe()
+	// Flush guarantees the server has registered the inbox before llm.request
+	// can emit its first progress event.
+	if err := c.nc.FlushTimeout(5 * time.Second); err != nil {
+		return nil, fmt.Errorf("subscribe to llm progress: %w", err)
+	}
+
 	natsReq := map[string]interface{}{
 		"sessionId":           sessionID,
 		"userId":              req.UserID,
@@ -108,6 +130,7 @@ func (c *Client) RequestLLM(req *models.LLMRequest) (*models.LLMResponse, error)
 		"accessProfile":       req.AccessProfile,
 		"workspaceCompanyId":  req.WorkspaceCompanyID,
 		"workspaceProjectId":  req.WorkspaceProjectID,
+		"progressSubject":     progressSubject,
 	}
 	// Forward the session's access profile and workspace scoping so
 	// dev2-llm-service can gate its own tools and resolve personas.
@@ -115,12 +138,61 @@ func (c *Client) RequestLLM(req *models.LLMRequest) (*models.LLMResponse, error)
 		natsReq["workspacePtProjectKey"] = req.WorkspacePTProjectKey
 	}
 
-	var resp models.LLMResponse
-	err := c.enc.Request(fmt.Sprintf("%s.%s", SubjectLLMRequest, sessionID), natsReq, &resp, 120*time.Second)
+	payload, err := json.Marshal(natsReq)
 	if err != nil {
-		return nil, fmt.Errorf("llm.request failed: %w", err)
+		return nil, fmt.Errorf("marshal llm.request: %w", err)
 	}
-	return &resp, nil
+
+	requestCtx, cancel := context.WithTimeout(ctx, 120*time.Second)
+	defer cancel()
+	type requestResult struct {
+		msg *nats.Msg
+		err error
+	}
+	resultCh := make(chan requestResult, 1)
+	go func() {
+		msg, requestErr := c.nc.RequestWithContext(requestCtx, fmt.Sprintf("%s.%s", SubjectLLMRequest, sessionID), payload)
+		resultCh <- requestResult{msg: msg, err: requestErr}
+	}()
+
+	forwardProgress := func(msg *nats.Msg) {
+		if onProgress == nil {
+			return
+		}
+		var event models.ToolTraceEvent
+		if err := json.Unmarshal(msg.Data, &event); err != nil {
+			log.Printf("[nats] Ignoring invalid llm progress event: %v", err)
+			return
+		}
+		onProgress(event)
+	}
+
+	for {
+		select {
+		case msg := <-progressMessages:
+			forwardProgress(msg)
+		case result := <-resultCh:
+			// The NATS connection dispatches messages in wire order. Drain any
+			// progress already delivered before processing the final reply.
+			for {
+				select {
+				case msg := <-progressMessages:
+					forwardProgress(msg)
+				default:
+					if result.err != nil {
+						return nil, fmt.Errorf("llm.request failed: %w", result.err)
+					}
+					var resp models.LLMResponse
+					if err := json.Unmarshal(result.msg.Data, &resp); err != nil {
+						return nil, fmt.Errorf("decode llm.request response: %w", err)
+					}
+					return &resp, nil
+				}
+			}
+		case <-requestCtx.Done():
+			return nil, fmt.Errorf("llm.request failed: %w", requestCtx.Err())
+		}
+	}
 }
 
 // RequestCompanyProjects fetches the company's Dev2Projects from

@@ -1,6 +1,7 @@
 package handlers
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"log"
@@ -26,6 +27,13 @@ type AgentHandler struct {
 	toolExecutor  *tools.Executor
 	llmModel      string
 	llmProvider   string
+}
+
+type agentResult struct {
+	answer           string
+	toolCalls        []models.ToolCallDisplay
+	pendingApprovals []models.PendingApproval
+	totalTokens      int
 }
 
 func NewAgentHandler(
@@ -100,26 +108,6 @@ func (h *AgentHandler) Ask(w http.ResponseWriter, r *http.Request) {
 	h.saveMessage(r, session.ID, "user", req.Question, "", "")
 
 	llmReq := h.buildLLMRequest(systemPrompt, history, req, profile, project)
-	finalAnswer, toolCallResults, pendingApprovals := h.processLLMResponse(r, session, llmReq, req, profile, project)
-
-	h.recordPendingApprovals(r, session, actorUserID, pendingApprovals)
-
-	assistantMsg := &models.ChatMessage{
-		SessionID:        session.ID,
-		Role:             "assistant",
-		Content:          finalAnswer,
-		PendingApprovals: pendingApprovals,
-	}
-	if err := h.messageRepo.Create(r.Context(), assistantMsg); err != nil {
-		log.Printf("[agent] Save message error: %v", err)
-	}
-
-	if llmResp, _ := h.callLLM(llmReq); llmResp != nil && llmResp.Usage != nil {
-		h.sessionRepo.UpdateTokenCount(r.Context(), session.ID, llmResp.Usage.TotalTokens)
-	}
-
-	go h.natsClient.PublishMessageSent(session.ID, req.CompanyID, req.UserID, "user", req.Question)
-	go h.natsClient.PublishMessageSent(session.ID, req.CompanyID, req.UserID, "assistant", finalAnswer)
 
 	var sources []models.Source
 	if knowledgeContext != "" {
@@ -127,15 +115,23 @@ func (h *AgentHandler) Ask(w http.ResponseWriter, r *http.Request) {
 	}
 
 	if req.Stream || r.URL.Query().Get("stream") == "true" {
-		h.streamAnswer(w, session, finalAnswer, toolCallResults, pendingApprovals, sources)
+		h.streamAnswer(w, r, session, llmReq, req, profile, project, actorUserID, sources)
 		return
 	}
 
+	var progress []models.ToolTraceEvent
+	result := h.processLLMResponse(r, session, llmReq, req, profile, project, func(event models.ToolTraceEvent) {
+		progress = append(progress, event)
+	})
+	toolTrace := models.NormalizeToolTrace(progress)
+	h.finishAsk(r, session, req, actorUserID, result, toolTrace)
+
 	respondJSON(w, http.StatusOK, models.ChatResponse{
-		Answer:           finalAnswer,
+		Answer:           result.answer,
 		ConversationID:   session.ID,
-		ToolCalls:        toolCallResults,
-		PendingApprovals: pendingApprovals,
+		ToolCalls:        result.toolCalls,
+		ToolTrace:        toolTrace,
+		PendingApprovals: result.pendingApprovals,
 		Sources:          sources,
 	})
 }
@@ -316,19 +312,24 @@ func (h *AgentHandler) buildLLMRequest(systemPrompt string, history []models.Cha
 	return llmReq
 }
 
-func (h *AgentHandler) processLLMResponse(r *http.Request, session *models.ChatSession, llmReq *models.LLMRequest, req models.ChatRequest, profile string, project *models.CompanyProject) (string, []models.ToolCallDisplay, []models.PendingApproval) {
-	llmResp, err := h.callLLM(llmReq)
+func (h *AgentHandler) processLLMResponse(r *http.Request, session *models.ChatSession, llmReq *models.LLMRequest, req models.ChatRequest, profile string, project *models.CompanyProject, onProgress func(models.ToolTraceEvent)) agentResult {
+	llmResp, err := h.callLLM(r.Context(), llmReq, onProgress)
 	if err != nil {
 		log.Printf("[agent] LLM call failed: %v", err)
-		return "AI service unavailable. Please try again.", nil, nil
+		return agentResult{answer: "AI service unavailable. Please try again."}
+	}
+	if llmResp == nil {
+		return agentResult{answer: "AI service unavailable. Please try again."}
 	}
 
-	finalAnswer := llmResp.Content
-	var toolCallResults []models.ToolCallDisplay
+	result := agentResult{answer: llmResp.Content}
+	if llmResp.Usage != nil {
+		result.totalTokens = llmResp.Usage.TotalTokens
+	}
 
 	// Approval-gated tools executed inside dev2-llm-service report back as
 	// tool results with a pending_approval payload (DEV2-108).
-	pendingApprovals := parsePendingApprovals(llmResp.ToolResults)
+	result.pendingApprovals = parsePendingApprovals(llmResp.ToolResults)
 
 	if len(llmResp.ToolCalls) > 0 {
 		assistantMsg := &models.ChatMessage{
@@ -353,23 +354,26 @@ func (h *AgentHandler) processLLMResponse(r *http.Request, session *models.ChatS
 		}
 
 		for _, tc := range llmResp.ToolCalls {
-			result := h.toolExecutor.Execute(r.Context(), tc, execCtx)
-			toolCallResults = append(toolCallResults, models.ToolCallDisplay{Name: tc.Function.Name, Result: result})
+			toolResult := h.toolExecutor.Execute(r.Context(), tc, execCtx)
+			result.toolCalls = append(result.toolCalls, models.ToolCallDisplay{Name: tc.Function.Name, Result: toolResult})
 			llmReq.Messages = append(llmReq.Messages, models.LLMMessage{
-				Role: "tool", Content: result, ToolCallID: tc.ID, Name: tc.Function.Name,
+				Role: "tool", Content: toolResult, ToolCallID: tc.ID, Name: tc.Function.Name,
 			})
 		}
 
-		followUpResp, err := h.callLLM(llmReq)
-		if err == nil && followUpResp.Content != "" {
-			finalAnswer = followUpResp.Content
+		followUpResp, err := h.callLLM(r.Context(), llmReq, onProgress)
+		if err == nil && followUpResp != nil && followUpResp.Content != "" {
+			result.answer = followUpResp.Content
 		}
-		if err == nil {
-			pendingApprovals = append(pendingApprovals, parsePendingApprovals(followUpResp.ToolResults)...)
+		if err == nil && followUpResp != nil {
+			result.pendingApprovals = append(result.pendingApprovals, parsePendingApprovals(followUpResp.ToolResults)...)
+			if followUpResp.Usage != nil {
+				result.totalTokens += followUpResp.Usage.TotalTokens
+			}
 		}
 	}
 
-	return finalAnswer, toolCallResults, pendingApprovals
+	return result
 }
 
 // parsePendingApprovals extracts approval requests from dev2-llm-service
@@ -440,11 +444,10 @@ func (h *AgentHandler) recordPendingApprovals(r *http.Request, session *models.C
 	}
 }
 
-// streamAnswer writes the completed answer as Server-Sent Events. The NATS
-// llm.request exchange is single-shot request-reply, so the final content is
-// chunked here rather than token-streamed from the LLM — token-level
-// streaming and tool-call trace visibility are DEV2-100 follow-ups.
-func (h *AgentHandler) streamAnswer(w http.ResponseWriter, session *models.ChatSession, answer string, toolCalls []models.ToolCallDisplay, pendingApprovals []models.PendingApproval, sources []models.Source) {
+// streamAnswer owns all ResponseWriter access. The worker reports progress and
+// its final result over channels so NATS callbacks can never write SSE data
+// concurrently.
+func (h *AgentHandler) streamAnswer(w http.ResponseWriter, r *http.Request, session *models.ChatSession, llmReq *models.LLMRequest, req models.ChatRequest, profile string, project *models.CompanyProject, actorUserID string, sources []models.Source) {
 	flusher, ok := w.(http.Flusher)
 	if !ok {
 		respondError(w, http.StatusInternalServerError, "streaming not supported")
@@ -455,21 +458,84 @@ func (h *AgentHandler) streamAnswer(w http.ResponseWriter, session *models.ChatS
 	w.Header().Set("Connection", "keep-alive")
 	w.WriteHeader(http.StatusOK)
 
-	for _, chunk := range chunkText(answer, 200) {
-		data, _ := json.Marshal(map[string]string{"content": chunk})
-		fmt.Fprintf(w, "event: chunk\ndata: %s\n\n", data)
-		flusher.Flush()
-	}
-
-	meta, _ := json.Marshal(models.ChatResponse{
-		ConversationID:   session.ID,
-		ToolCalls:        toolCalls,
-		PendingApprovals: pendingApprovals,
-		Sources:          sources,
-	})
-	fmt.Fprintf(w, "event: meta\ndata: %s\n\n", meta)
-	fmt.Fprintf(w, "event: done\ndata: [DONE]\n\n")
 	flusher.Flush()
+
+	progressCh := make(chan models.ToolTraceEvent, 64)
+	resultCh := make(chan agentResult, 1)
+	go func() {
+		result := h.processLLMResponse(r, session, llmReq, req, profile, project, func(event models.ToolTraceEvent) {
+			select {
+			case progressCh <- event:
+			case <-r.Context().Done():
+			}
+		})
+		select {
+		case resultCh <- result:
+		case <-r.Context().Done():
+		}
+	}()
+
+	var progress []models.ToolTraceEvent
+	for {
+		select {
+		case event := <-progressCh:
+			progress = append(progress, event)
+			if err := writeSSEJSON(w, flusher, "trace", event); err != nil {
+				return
+			}
+		case result := <-resultCh:
+			// processLLMResponse sends its result only after every progress
+			// callback has completed, so all remaining events are now buffered.
+		drainProgress:
+			for {
+				select {
+				case event := <-progressCh:
+					progress = append(progress, event)
+					if err := writeSSEJSON(w, flusher, "trace", event); err != nil {
+						return
+					}
+				default:
+					break drainProgress
+				}
+			}
+
+			toolTrace := models.NormalizeToolTrace(progress)
+			h.finishAsk(r, session, req, actorUserID, result, toolTrace)
+			for _, chunk := range chunkText(result.answer, 200) {
+				if err := writeSSEJSON(w, flusher, "chunk", map[string]string{"content": chunk}); err != nil {
+					return
+				}
+			}
+			if err := writeSSEJSON(w, flusher, "meta", models.ChatResponse{
+				ConversationID:   session.ID,
+				ToolCalls:        result.toolCalls,
+				ToolTrace:        toolTrace,
+				PendingApprovals: result.pendingApprovals,
+				Sources:          sources,
+			}); err != nil {
+				return
+			}
+			if _, err := fmt.Fprint(w, "event: done\ndata: [DONE]\n\n"); err != nil {
+				return
+			}
+			flusher.Flush()
+			return
+		case <-r.Context().Done():
+			return
+		}
+	}
+}
+
+func writeSSEJSON(w http.ResponseWriter, flusher http.Flusher, event string, value any) error {
+	data, err := json.Marshal(value)
+	if err != nil {
+		return err
+	}
+	if _, err := fmt.Fprintf(w, "event: %s\ndata: %s\n\n", event, data); err != nil {
+		return err
+	}
+	flusher.Flush()
+	return nil
 }
 
 // chunkText splits s into rune chunks of at most size, breaking on
@@ -500,18 +566,44 @@ func chunkText(s string, size int) []string {
 	return chunks
 }
 
-func (h *AgentHandler) callLLM(req *models.LLMRequest) (*models.LLMResponse, error) {
+func (h *AgentHandler) callLLM(ctx context.Context, req *models.LLMRequest, onProgress func(models.ToolTraceEvent)) (*models.LLMResponse, error) {
 	if h.natsClient != nil {
-		resp, err := h.natsClient.RequestLLM(req)
+		resp, err := h.natsClient.RequestLLMWithProgress(ctx, req, onProgress)
 		if err == nil {
 			return resp, nil
 		}
 		log.Printf("[agent] NATS LLM failed, fallback to HTTP: %v", err)
+		if ctx.Err() != nil {
+			return nil, ctx.Err()
+		}
 	}
 	if h.llmClient != nil {
-		return h.llmClient.ChatCompletion(req)
+		return h.llmClient.ChatCompletionWithContext(ctx, req)
 	}
-	return nil, nil
+	return nil, fmt.Errorf("LLM service unavailable")
+}
+
+func (h *AgentHandler) finishAsk(r *http.Request, session *models.ChatSession, req models.ChatRequest, actorUserID string, result agentResult, toolTrace []models.ToolTraceEvent) {
+	h.recordPendingApprovals(r, session, actorUserID, result.pendingApprovals)
+	assistantMsg := &models.ChatMessage{
+		SessionID:        session.ID,
+		Role:             "assistant",
+		Content:          result.answer,
+		PendingApprovals: result.pendingApprovals,
+		ToolTrace:        toolTrace,
+	}
+	if err := h.messageRepo.Create(r.Context(), assistantMsg); err != nil {
+		log.Printf("[agent] Save message error: %v", err)
+	}
+	if result.totalTokens > 0 {
+		if err := h.sessionRepo.UpdateTokenCount(r.Context(), session.ID, result.totalTokens); err != nil {
+			log.Printf("[agent] Update token count error: %v", err)
+		}
+	}
+	if h.natsClient != nil {
+		go h.natsClient.PublishMessageSent(session.ID, req.CompanyID, req.UserID, "user", req.Question)
+		go h.natsClient.PublishMessageSent(session.ID, req.CompanyID, req.UserID, "assistant", result.answer)
+	}
 }
 
 func (h *AgentHandler) saveMessage(r *http.Request, sessionID, role, content, toolCallID, name string) {

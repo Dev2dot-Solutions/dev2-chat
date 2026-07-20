@@ -33,6 +33,7 @@ type ChatMessage struct {
 	// PendingApprovals carries the approval cards surfaced with this message
 	// (DEV2-108) so session reloads re-render them.
 	PendingApprovals []PendingApproval `bson:"pendingApprovals,omitempty" json:"pendingApprovals,omitempty"`
+	ToolTrace        []ToolTraceEvent  `bson:"toolTrace,omitempty" json:"toolTrace,omitempty"`
 	TokenCount       int               `bson:"tokenCount,omitempty" json:"tokenCount,omitempty"`
 	CreatedAt        time.Time         `bson:"createdAt" json:"createdAt"`
 }
@@ -90,8 +91,29 @@ type ChatResponse struct {
 	Answer           string            `json:"answer"`
 	ConversationID   string            `json:"conversationId"`
 	ToolCalls        []ToolCallDisplay `json:"toolCalls,omitempty"`
+	ToolTrace        []ToolTraceEvent  `json:"toolTrace,omitempty"`
 	PendingApprovals []PendingApproval `json:"pendingApprovals,omitempty"`
 	Sources          []Source          `json:"sources,omitempty"`
+}
+
+// ToolTraceEvent is safe progress metadata emitted by dev2-llm-service. It
+// intentionally has no fields for tool arguments, output, prompts, or other
+// potentially sensitive payloads.
+type ToolTraceEvent struct {
+	EventID          string `bson:"eventId" json:"eventId"`
+	Type             string `bson:"type" json:"type"`
+	SessionID        string `bson:"sessionId" json:"sessionId"`
+	ToolCallID       string `bson:"toolCallId,omitempty" json:"toolCallId,omitempty"`
+	ParentToolCallID string `bson:"parentToolCallId,omitempty" json:"parentToolCallId,omitempty"`
+	ToolName         string `bson:"toolName,omitempty" json:"toolName,omitempty"`
+	PersonaName      string `bson:"personaName,omitempty" json:"personaName,omitempty"`
+	PersonaScope     string `bson:"personaScope,omitempty" json:"personaScope,omitempty"`
+	DelegationDepth  int    `bson:"delegationDepth" json:"delegationDepth"`
+	Summary          string `bson:"summary" json:"summary"`
+	Status           string `bson:"status" json:"status"`
+	Timestamp        string `bson:"timestamp" json:"timestamp"`
+	DurationMS       *int64 `bson:"durationMs,omitempty" json:"durationMs,omitempty"`
+	Success          *bool  `bson:"success,omitempty" json:"success,omitempty"`
 }
 
 // ToolCallDisplay represents a tool call shown in the response.

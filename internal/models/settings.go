@@ -54,6 +54,9 @@ type LLMRequest struct {
 	WorkspaceCompanyID    string `json:"workspaceCompanyId,omitempty"`
 	WorkspaceProjectID    string `json:"workspaceProjectId,omitempty"`
 	WorkspacePTProjectKey string `json:"workspacePtProjectKey,omitempty"`
+	// ProgressSubject is populated by the NATS client with a unique inbox.
+	// It is not forwarded to direct LLM APIs.
+	ProgressSubject string `json:"progressSubject,omitempty"`
 }
 
 // LLMMessage is a message in the LLM conversation.

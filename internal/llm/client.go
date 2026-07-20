@@ -2,6 +2,7 @@ package llm
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -33,6 +34,12 @@ func NewClient(apiKey, baseURL string) *Client {
 
 // ChatCompletion sends a chat completion request to an OpenAI-compatible API.
 func (c *Client) ChatCompletion(req *models.LLMRequest) (*models.LLMResponse, error) {
+	return c.ChatCompletionWithContext(context.Background(), req)
+}
+
+// ChatCompletionWithContext sends a completion request that can be cancelled
+// when its originating HTTP request disconnects.
+func (c *Client) ChatCompletionWithContext(ctx context.Context, req *models.LLMRequest) (*models.LLMResponse, error) {
 	if c.apiKey == "" {
 		return nil, fmt.Errorf("LLM API key not configured")
 	}
@@ -58,7 +65,7 @@ func (c *Client) ChatCompletion(req *models.LLMRequest) (*models.LLMResponse, er
 	}
 
 	url := c.baseURL + "/chat/completions"
-	httpReq, err := http.NewRequest("POST", url, bytes.NewReader(payload))
+	httpReq, err := http.NewRequestWithContext(ctx, "POST", url, bytes.NewReader(payload))
 	if err != nil {
 		return nil, fmt.Errorf("create request: %w", err)
 	}
