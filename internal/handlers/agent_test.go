@@ -11,9 +11,9 @@ import (
 	"go.mongodb.org/mongo-driver/mongo/integration/mtest"
 )
 
-func TestBuildStreamMetaSerializesFinalAnswer(t *testing.T) {
+func TestBuildSocketMetaSerializesFinalAnswer(t *testing.T) {
 	const answer = "The exact final answer"
-	meta := buildStreamMeta("session-1", agentResult{answer: answer}, []models.ToolTraceEvent{{SpanID: "span-1", Type: "tool_completed"}}, nil)
+	meta := buildSocketMeta("session-1", agentResult{answer: answer}, []models.ToolTraceEvent{{SpanID: "span-1", Type: "tool_completed"}}, nil)
 
 	payload, err := json.Marshal(meta)
 	if err != nil {

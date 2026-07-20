@@ -64,31 +64,14 @@ func TestProductionRequiresNarrowTrustedProxyConfiguration(t *testing.T) {
 	}
 }
 
-func TestLegacyTransportDefaultsOffOutsideDevelopment(t *testing.T) {
-	for _, test := range []struct {
-		environment string
-		enabled     bool
-	}{{"production", false}, {"development", true}} {
-		t.Run(test.environment, func(t *testing.T) {
-			t.Setenv("ENVIRONMENT", test.environment)
-			t.Setenv("CHAT_SOCKET_REQUIRE_TRUSTED_PROXY", "false")
-			t.Setenv("CHAT_LEGACY_ACTIVE_TRANSPORT_ENABLED", "")
-			cfg, err := Load()
-			if err != nil {
-				t.Fatal(err)
-			}
-			if cfg.LegacyActiveTransport != test.enabled {
-				t.Fatalf("legacy transport enabled=%v", cfg.LegacyActiveTransport)
-			}
-		})
-	}
-}
-
-func TestProductionCannotEnableLegacyActiveTransport(t *testing.T) {
+func TestStaleTransportConfigurationIsIgnored(t *testing.T) {
 	t.Setenv("ENVIRONMENT", "production")
-	t.Setenv("CHAT_LEGACY_ACTIVE_TRANSPORT_ENABLED", "true")
 	t.Setenv("CHAT_SOCKET_REQUIRE_TRUSTED_PROXY", "false")
-	if _, err := Load(); err == nil {
-		t.Fatal("production enabled the legacy active transport")
+	cfg, err := Load()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.Environment != "production" {
+		t.Fatalf("unexpected environment: %s", cfg.Environment)
 	}
 }

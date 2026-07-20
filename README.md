@@ -10,7 +10,7 @@ HTTP calls when NATS is unavailable.
 ## Architecture
 
 ```
-User ──HTTP/WebSocket──▶ dev2-chat ──NATS──▶ dev2-llm-service
+User ──WebSocket──▶ dev2-chat ──NATS──▶ dev2-llm-service
                         │
                         ├─NATS──▶ dev2-knowledge (knowledge search)
                         │
@@ -24,20 +24,15 @@ User ──HTTP/WebSocket──▶ dev2-chat ──NATS──▶ dev2-llm-servic
 | Method | Path | Description |
 |--------|------|-------------|
 | GET | /health | Health check |
-| POST | /agent/ask | Legacy REST/SSE generation (`410` by default) |
-| POST | /chat | Legacy active endpoint (`410` by default) |
 | POST | /chat/socket-ticket | Issue a 30-second, one-use WebSocket ticket |
-| GET | /chat/ws | Primary active-chat WebSocket transport (subprotocol ticket) |
+| GET | /chat/ws | Active chat WebSocket transport (subprotocol ticket) |
 | GET | /chat/sessions | List chat sessions |
 | GET | /chat/sessions/{id} | Get session with messages |
 | GET | /settings/llm?company_id= | Get LLM config |
 | GET | /settings/pt?company_id= | Get PT config |
 
-`POST /agent/ask`, its deprecated SSE mode, `POST /chat`, and REST approval
-decisions are disabled with `410 Gone` by default in production. Set
-`CHAT_LEGACY_ACTIVE_TRANSPORT_ENABLED=true` only in development; production
-configuration rejects attempts to enable it. Durable session/history APIs
-remain REST endpoints.
+WebSocket is the only active chat transport. Durable session/history and
+settings APIs remain REST endpoints.
 
 Session/history authorization is also live: non-admin list scope always comes
 from authenticated company/user claims, and both list/detail endpoints filter
@@ -196,31 +191,11 @@ transport peer is outside those CIDRs. Do not substitute a broad
 private-network CIDR. The tracked Compose port is loopback-only
 (`127.0.0.1:8085:8080`).
 
-## POST /agent/ask
+## Durable session history
 
-### Request
-```json
-{
-  "company_id": "uuid",
-  "user_id": "uuid",
-  "question": "How do I add CSV export?",
-  "conversation_id": "uuid"
-}
-```
-
-### Response
-```json
-{
-  "answer": "To add CSV export...",
-  "conversation_id": "uuid",
-  "tool_calls": [
-    {"name": "search_knowledge", "result": "..."}
-  ],
-  "sources": [
-    {"type": "knowledge_graph", "label": "Context from knowledge graph"}
-  ]
-}
-```
+`GET /chat/sessions` and `GET /chat/sessions/{id}` provide durable session and
+message history used after reconnect, while live generation stays on the
+WebSocket transport.
 
 ## Available Tools
 
@@ -250,10 +225,9 @@ private-network CIDR. The tracked Compose port is loopback-only
 | TICKETS_SVC_URL | http://dev2-tickets:8080 | dev2-tickets HTTP URL |
 | PT_SVC_URL | https://app.project-tracker.ai/api | Project Tracker API |
 | ENVIRONMENT | production | `development` adds localhost to defaults |
-| CHAT_LEGACY_ACTIVE_TRANSPORT_ENABLED | false in production | Enable deprecated transports in development only |
 | AUTHENTIK_ISSUER | — | Required JWT issuer |
 | AUTHENTIK_AUDIENCE | — | Required JWT audience |
-| CHAT_ALLOWED_ORIGINS | https://dev2.solutions | REST/SSE CORS origins |
+| CHAT_ALLOWED_ORIGINS | https://dev2.solutions | REST CORS origins |
 | CHAT_SOCKET_ALLOWED_ORIGINS | https://dev2.solutions | Exact WebSocket origins (no wildcards) |
 | CHAT_SOCKET_TRUSTED_PROXY_CIDRS | empty | Proxy CIDRs trusted for forwarded client IP |
 | CHAT_SOCKET_REQUIRE_TRUSTED_PROXY | true in production | Fail startup without a trusted proxy CIDR |

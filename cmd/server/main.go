@@ -120,9 +120,6 @@ func main() {
 		llmClient, natsClient, toolExecutor,
 		cfg.LLMModel, cfg.LLMProvider,
 	)
-	chatHandler.SetLegacyActiveTransportEnabled(cfg.LegacyActiveTransport)
-	agentHandler.SetLegacyActiveTransportEnabled(cfg.LegacyActiveTransport)
-	agentHandler.SetLegacyDeveloperMaxAge(cfg.SocketDeveloperMaxLifetime)
 	chatHandler.SetAgentHandler(agentHandler)
 	settingsHandler := handlers.NewSettingsHandler(settingsRepo)
 	socketHandler := handlers.NewSocketHandler(socketRepo, agentHandler, chatHandler, handlers.SocketOptions{
@@ -186,7 +183,6 @@ func main() {
 
 	// Register routes
 	chatHandler.Routes(r)
-	agentHandler.Routes(r)
 	settingsHandler.Routes(r)
 	socketHandler.Routes(r)
 

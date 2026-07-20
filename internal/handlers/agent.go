@@ -14,29 +14,18 @@ import (
 	"github.com/Dev2dot-Solutions/dev2-chat/internal/nats"
 	"github.com/Dev2dot-Solutions/dev2-chat/internal/repository"
 	"github.com/Dev2dot-Solutions/dev2-chat/internal/tools"
-	"github.com/go-chi/chi/v5"
 )
 
 type AgentHandler struct {
-	sessionRepo           *repository.SessionRepo
-	messageRepo           *repository.MessageRepo
-	approvalRepo          *repository.ApprovalRepo
-	knowledgeRepo         *repository.KnowledgeRepo
-	llmClient             *llm.Client
-	natsClient            *nats.Client
-	toolExecutor          *tools.Executor
-	llmModel              string
-	llmProvider           string
-	legacyActiveTransport bool
-	legacyDeveloperMaxAge time.Duration
-}
-
-func (h *AgentHandler) SetLegacyActiveTransportEnabled(enabled bool) {
-	h.legacyActiveTransport = enabled
-}
-
-func (h *AgentHandler) SetLegacyDeveloperMaxAge(maxAge time.Duration) {
-	h.legacyDeveloperMaxAge = maxAge
+	sessionRepo   *repository.SessionRepo
+	messageRepo   *repository.MessageRepo
+	approvalRepo  *repository.ApprovalRepo
+	knowledgeRepo *repository.KnowledgeRepo
+	llmClient     *llm.Client
+	natsClient    *nats.Client
+	toolExecutor  *tools.Executor
+	llmModel      string
+	llmProvider   string
 }
 
 type agentResult struct {
@@ -85,110 +74,7 @@ func NewAgentHandler(
 	}
 }
 
-func (h *AgentHandler) Routes(r chi.Router) {
-	r.Post("/agent/ask", h.Ask)
-}
-
-func (h *AgentHandler) Ask(w http.ResponseWriter, r *http.Request) {
-	if !h.legacyActiveTransport {
-		respondError(w, http.StatusGone, "legacy active chat transport is disabled; use WebSocket")
-		return
-	}
-	var req models.ChatRequest
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		respondError(w, http.StatusBadRequest, "invalid request body")
-		return
-	}
-	if companyID := GetCompanyID(r); companyID != "" {
-		// Authenticated company identity wins whenever the token carries it.
-		req.CompanyID = companyID
-	}
-	if req.CompanyID == "" || req.Question == "" {
-		respondError(w, http.StatusBadRequest, "companyId and question are required")
-		return
-	}
-	if status, errMsg := h.validateLegacyRequestAuthorization(r, req); errMsg != "" {
-		respondError(w, status, errMsg)
-		return
-	}
-
-	prepared, status, errMsg := h.prepareAgentRequest(r, req)
-	if errMsg != "" {
-		respondError(w, status, errMsg)
-		return
-	}
-
-	if req.Stream || r.URL.Query().Get("stream") == "true" {
-		h.streamAnswer(w, r, prepared)
-		return
-	}
-
-	completed := h.completeAgentRequest(r, prepared, nil)
-	if completed.result.cancelled {
-		respondError(w, http.StatusRequestTimeout, "generation cancelled")
-		return
-	}
-
-	respondJSON(w, http.StatusOK, models.ChatResponse{
-		Answer:           completed.result.answer,
-		ConversationID:   prepared.session.ID,
-		ToolCalls:        completed.result.toolCalls,
-		ToolTrace:        completed.toolTrace,
-		PendingApprovals: completed.result.pendingApprovals,
-		Sources:          prepared.sources,
-	})
-}
-
-func (h *AgentHandler) validateLegacyRequestAuthorization(r *http.Request, req models.ChatRequest) (int, string) {
-	if req.ConversationID != "" {
-		session, err := h.sessionRepo.GetByID(r.Context(), req.ConversationID)
-		if err != nil {
-			return http.StatusInternalServerError, "failed to load session"
-		}
-		if session != nil {
-			return h.validateCurrentSessionAuthorization(r, session, h.legacyDeveloperMaxAge)
-		}
-	}
-	profile := models.NormalizeAccessProfile(req.AccessProfile)
-	return h.validateCurrentSessionAuthorization(r, &models.ChatSession{
-		CompanyID: req.CompanyID, UserID: GetUserID(r), AccessProfile: profile, ProjectID: req.ProjectID,
-	}, h.legacyDeveloperMaxAge)
-}
-
-func (h *AgentHandler) validateCurrentSessionAuthorization(r *http.Request, session *models.ChatSession, developerMaxAge time.Duration) (int, string) {
-	if session == nil || session.ProjectID == "" {
-		return http.StatusForbidden, "project-bound session is required"
-	}
-	if companyID := GetCompanyID(r); companyID != "" && companyID != session.CompanyID {
-		return http.StatusForbidden, "session belongs to a different company"
-	}
-	profile := models.NormalizeAccessProfile(session.AccessProfile)
-	if profile == models.AccessProfileDeveloper {
-		if !GetIsAdmin(r) {
-			return http.StatusForbidden, "developer sessions require an admin user"
-		}
-		issuedAt := GetAuthIssuedAt(r)
-		if developerMaxAge > 0 && (issuedAt.IsZero() || time.Since(issuedAt) > developerMaxAge) {
-			return http.StatusUnauthorized, "developer authentication must be refreshed"
-		}
-	}
-	project, err := h.lookupProjectFresh(r, session.CompanyID, session.ProjectID)
-	if err != nil {
-		return http.StatusServiceUnavailable, "project authorization unavailable"
-	}
-	if project == nil || (project.CompanyID != "" && project.CompanyID != session.CompanyID) {
-		return http.StatusForbidden, "project authorization revoked"
-	}
-	if profile == models.AccessProfileClient && !project.Visibility.Client {
-		return http.StatusForbidden, "client project access revoked"
-	}
-	if profile == models.AccessProfileDeveloper && !project.Visibility.Developer {
-		return http.StatusForbidden, "developer project access revoked"
-	}
-	return 0, ""
-}
-
-// prepareAgentRequest is shared by REST/SSE and WebSocket transports. It owns
+// prepareAgentRequest is shared by WebSocket generation handlers. It owns
 // all session creation, identity binding, project visibility, history and
 // prompt preparation so transport handlers cannot fork chat business logic.
 func (h *AgentHandler) prepareAgentRequest(r *http.Request, req models.ChatRequest) (*preparedAgentRequest, int, string) {
@@ -581,112 +467,7 @@ func (h *AgentHandler) recordPendingApprovals(r *http.Request, session *models.C
 	}
 }
 
-// streamAnswer owns all ResponseWriter access. The worker reports progress and
-// its final result over channels so NATS callbacks can never write SSE data
-// concurrently.
-func (h *AgentHandler) streamAnswer(w http.ResponseWriter, r *http.Request, prepared *preparedAgentRequest) {
-	if r.Context().Err() != nil {
-		return
-	}
-	flusher, ok := w.(http.Flusher)
-	if !ok {
-		respondError(w, http.StatusInternalServerError, "streaming not supported")
-		return
-	}
-	w.Header().Set("Content-Type", "text/event-stream")
-	w.Header().Set("Cache-Control", "no-cache")
-	w.Header().Set("Connection", "keep-alive")
-	w.WriteHeader(http.StatusOK)
-
-	flusher.Flush()
-
-	progressCh := make(chan models.ToolTraceEvent, 64)
-	resultCh := make(chan agentResult, 1)
-	go func() {
-		completed := h.completeAgentRequest(r, prepared, func(event models.ToolTraceEvent) {
-			if !models.IsToolTraceEvent(event) {
-				return
-			}
-			if r.Context().Err() != nil {
-				return
-			}
-			select {
-			case progressCh <- event:
-			case <-r.Context().Done():
-			}
-		})
-		select {
-		case resultCh <- completed.result:
-		case <-r.Context().Done():
-		}
-	}()
-
-	var progress []models.ToolTraceEvent
-	for {
-		select {
-		case event := <-progressCh:
-			if r.Context().Err() != nil {
-				return
-			}
-			progress = append(progress, event)
-			if err := writeSSEJSON(w, flusher, "trace", event); err != nil {
-				return
-			}
-		case result := <-resultCh:
-			if r.Context().Err() != nil {
-				return
-			}
-			// processLLMResponse sends its result only after every progress
-			// callback has completed, so all remaining events are now buffered.
-		drainProgress:
-			for {
-				select {
-				case event := <-progressCh:
-					if r.Context().Err() != nil {
-						return
-					}
-					progress = append(progress, event)
-					if err := writeSSEJSON(w, flusher, "trace", event); err != nil {
-						return
-					}
-				default:
-					break drainProgress
-				}
-			}
-
-			if result.cancelled {
-				return
-			}
-			toolTrace := models.NormalizeToolTrace(progress)
-			for _, chunk := range chunkText(result.answer, 200) {
-				if r.Context().Err() != nil {
-					return
-				}
-				if err := writeSSEJSON(w, flusher, "chunk", map[string]string{"content": chunk}); err != nil {
-					return
-				}
-			}
-			if r.Context().Err() != nil {
-				return
-			}
-			if err := writeSSEJSON(w, flusher, "meta", buildStreamMeta(prepared.session.ID, result, toolTrace, prepared.sources)); err != nil {
-				return
-			}
-			if r.Context().Err() != nil {
-				return
-			}
-			if _, err := fmt.Fprint(w, "event: done\ndata: [DONE]\n\n"); err != nil {
-				return
-			}
-			flusher.Flush()
-			return
-		case <-r.Context().Done():
-			return
-		}
-	}
-}
-
-func buildStreamMeta(sessionID string, result agentResult, toolTrace []models.ToolTraceEvent, sources []models.Source) models.ChatResponse {
+func buildSocketMeta(sessionID string, result agentResult, toolTrace []models.ToolTraceEvent, sources []models.Source) models.ChatResponse {
 	return models.ChatResponse{
 		Answer:           result.answer,
 		ConversationID:   sessionID,
@@ -695,18 +476,6 @@ func buildStreamMeta(sessionID string, result agentResult, toolTrace []models.To
 		PendingApprovals: result.pendingApprovals,
 		Sources:          sources,
 	}
-}
-
-func writeSSEJSON(w http.ResponseWriter, flusher http.Flusher, event string, value any) error {
-	data, err := json.Marshal(value)
-	if err != nil {
-		return err
-	}
-	if _, err := fmt.Fprintf(w, "event: %s\ndata: %s\n\n", event, data); err != nil {
-		return err
-	}
-	flusher.Flush()
-	return nil
 }
 
 // chunkText splits s into rune chunks of at most size, breaking on

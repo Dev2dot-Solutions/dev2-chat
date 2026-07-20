@@ -4,26 +4,25 @@ import (
 	"context"
 	"net/http"
 	"net/http/httptest"
-	"strings"
 	"testing"
 
 	"github.com/Dev2dot-Solutions/dev2-chat/internal/models"
+	"github.com/go-chi/chi/v5"
 )
 
-func TestLegacyActiveTransportDisabled(t *testing.T) {
-	agent := &AgentHandler{}
-	request := httptest.NewRequest(http.MethodPost, "/agent/ask", strings.NewReader(`{"question":"hello"}`))
-	response := httptest.NewRecorder()
-	agent.Ask(response, request)
-	if response.Code != http.StatusGone {
-		t.Fatalf("disabled agent transport returned %d", response.Code)
-	}
-
-	chat := &ChatHandler{}
-	response = httptest.NewRecorder()
-	chat.DecideApproval(response, httptest.NewRequest(http.MethodPost, "/chat/approvals/a", strings.NewReader(`{"decision":"approve"}`)))
-	if response.Code != http.StatusGone {
-		t.Fatalf("disabled REST approval transport returned %d", response.Code)
+func TestLegacyActiveRoutesAreNotRegistered(t *testing.T) {
+	router := chi.NewRouter()
+	(&ChatHandler{}).Routes(router)
+	for _, request := range []*http.Request{
+		httptest.NewRequest(http.MethodPost, "/agent/ask", nil),
+		httptest.NewRequest(http.MethodPost, "/chat/approvals/a", nil),
+		httptest.NewRequest(http.MethodPost, "/chat", nil),
+	} {
+		response := httptest.NewRecorder()
+		router.ServeHTTP(response, request)
+		if response.Code != http.StatusNotFound {
+			t.Fatalf("removed route %s %s returned %d", request.Method, request.URL.Path, response.Code)
+		}
 	}
 }
 

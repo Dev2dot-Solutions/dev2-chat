@@ -1,7 +1,6 @@
 package handlers
 
 import (
-	"encoding/json"
 	"fmt"
 	"log"
 	"net/http"
@@ -14,21 +13,14 @@ import (
 )
 
 type ChatHandler struct {
-	sessionRepo           *repository.SessionRepo
-	messageRepo           *repository.MessageRepo
-	approvalRepo          *repository.ApprovalRepo
-	natsClient            *nats.Client
-	legacyActiveTransport bool
-	agentHandler          *AgentHandler
-	projectResolver       func(string) ([]models.CompanyProject, error)
-}
-
-func (h *ChatHandler) SetLegacyActiveTransportEnabled(enabled bool) {
-	h.legacyActiveTransport = enabled
+	sessionRepo     *repository.SessionRepo
+	messageRepo     *repository.MessageRepo
+	approvalRepo    *repository.ApprovalRepo
+	natsClient      *nats.Client
+	projectResolver func(string) ([]models.CompanyProject, error)
 }
 
 func (h *ChatHandler) SetAgentHandler(agent *AgentHandler) {
-	h.agentHandler = agent
 	if agent != nil && agent.natsClient != nil {
 		h.projectResolver = agent.natsClient.RequestCompanyProjectsFresh
 	}
@@ -40,23 +32,8 @@ func NewChatHandler(sr *repository.SessionRepo, mr *repository.MessageRepo, ar *
 
 func (h *ChatHandler) Routes(r chi.Router) {
 	r.Route("/chat", func(r chi.Router) {
-		r.Post("/", h.SendMessage)                          // POST /chat — send message, get response
-		r.Get("/sessions", h.ListSessions)                  // GET /chat/sessions — list sessions
-		r.Get("/sessions/{id}", h.GetSession)               // GET /chat/sessions/{id} — get session with messages
-		r.Post("/approvals/{approvalId}", h.DecideApproval) // POST /chat/approvals/{approvalId} — approve/reject a pending tool call
-	})
-}
-
-// SendMessage handles POST /chat (alias kept for compatibility, logic is in AgentHandler.Ask)
-func (h *ChatHandler) SendMessage(w http.ResponseWriter, r *http.Request) {
-	if !h.legacyActiveTransport {
-		respondError(w, http.StatusGone, "legacy active chat transport is disabled; use WebSocket")
-		return
-	}
-	// Chat messages are now handled by the /agent/ask endpoint
-	// This is a lightweight wrapper that creates a session if needed
-	respondJSON(w, http.StatusOK, map[string]string{
-		"message": "Use POST /agent/ask for Q&A. This endpoint creates sessions.",
+		r.Get("/sessions", h.ListSessions)    // GET /chat/sessions — list sessions
+		r.Get("/sessions/{id}", h.GetSession) // GET /chat/sessions/{id} — get session with messages
 	})
 }
 
@@ -224,46 +201,8 @@ func stripActionableApprovals(messages []models.ChatMessage) {
 	}
 }
 
-// DecideApproval handles POST /chat/approvals/{approvalId} (DEV2-108).
-//
-// The approval is resolved to its session via the chat_approvals mapping
-// recorded when the pending card was surfaced. Authorization mirrors
-// GetSession: non-admins may only decide approvals on sessions they own, and
-// developer-profile sessions additionally require an admin. The sessionId
-// and userId forwarded on tool.approve come from the resolved session —
-// never from the request body.
-func (h *ChatHandler) DecideApproval(w http.ResponseWriter, r *http.Request) {
-	if !h.legacyActiveTransport {
-		respondError(w, http.StatusGone, "legacy approval transport is disabled; use WebSocket")
-		return
-	}
-	approvalID := chi.URLParam(r, "approvalId")
-	if approvalID == "" {
-		respondError(w, http.StatusBadRequest, "missing approval id")
-		return
-	}
-
-	var req struct {
-		Decision string `json:"decision"`
-	}
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		respondError(w, http.StatusBadRequest, "invalid request body")
-		return
-	}
-	if req.Decision != models.ApprovalDecisionApprove && req.Decision != models.ApprovalDecisionReject {
-		respondError(w, http.StatusBadRequest, "decision must be \"approve\" or \"reject\"")
-		return
-	}
-	status, payload, errMsg := h.decideApproval(r, approvalID, req.Decision)
-	if errMsg != "" {
-		respondError(w, status, errMsg)
-		return
-	}
-	respondJSON(w, status, payload)
-}
-
-// decideApproval contains the authorization and business transaction shared
-// by REST and WebSocket approval decisions.
+// decideApproval contains the authorization and business transaction used by
+// WebSocket approval decisions.
 func (h *ChatHandler) decideApproval(r *http.Request, approvalID, decision string) (int, map[string]any, string) {
 	rec, err := h.approvalRepo.GetByID(r.Context(), approvalID)
 	if err != nil {
@@ -285,11 +224,6 @@ func (h *ChatHandler) decideApproval(r *http.Request, approvalID, decision strin
 
 	if errMsg := approvalAuthorizationError(session, GetIsAdmin(r)); errMsg != "" {
 		return http.StatusForbidden, nil, errMsg
-	}
-	if h.legacyActiveTransport && h.agentHandler != nil {
-		if status, errMsg := h.agentHandler.validateCurrentSessionAuthorization(r, session, h.agentHandler.legacyDeveloperMaxAge); errMsg != "" {
-			return status, nil, errMsg
-		}
 	}
 	if companyID := GetCompanyID(r); companyID != "" && session.CompanyID != companyID {
 		return http.StatusForbidden, nil, "session belongs to a different company"

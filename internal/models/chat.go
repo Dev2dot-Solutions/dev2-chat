@@ -42,8 +42,8 @@ type ChatMessage struct {
 // PendingApproval describes a write/execute tool call awaiting a user
 // decision, surfaced from dev2-llm-service tool results whose payload has
 // status "pending_approval". Status starts as "pending" and is updated to
-// the decision outcome ("executed", "rejected", "expired") once decided via
-// POST /chat/approvals/{approvalId}.
+// the decision outcome ("executed", "rejected", "expired") once decided by
+// the WebSocket approval flow.
 type PendingApproval struct {
 	ApprovalID string    `bson:"approvalId" json:"approvalId"`
 	Tool       string    `bson:"tool" json:"tool"`
@@ -80,7 +80,6 @@ type ChatRequest struct {
 	ConversationID string `json:"conversationId,omitempty"`
 	Question       string `json:"question"`
 	RequestID      string `json:"requestId,omitempty"`
-	Stream         bool   `json:"stream,omitempty"`
 	// AccessProfile and ProjectID are only used when a new session is
 	// created by this request (no conversationId). Existing sessions keep
 	// the profile/project they were created with.

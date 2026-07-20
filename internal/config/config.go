@@ -12,7 +12,6 @@ import (
 // Config holds all configuration for dev2-chat.
 type Config struct {
 	Environment                string
-	LegacyActiveTransport      bool
 	Port                       int
 	MongoURI                   string
 	MongoDatabase              string
@@ -60,13 +59,6 @@ type Config struct {
 
 func Load() (*Config, error) {
 	environment := strings.ToLower(getEnv("ENVIRONMENT", "production"))
-	legacyTransport, err := getEnvBool("CHAT_LEGACY_ACTIVE_TRANSPORT_ENABLED", environment == "development")
-	if err != nil {
-		return nil, err
-	}
-	if environment == "production" && legacyTransport {
-		return nil, fmt.Errorf("CHAT_LEGACY_ACTIVE_TRANSPORT_ENABLED cannot be enabled in production")
-	}
 	requireTrustedProxy, err := getEnvBool("CHAT_SOCKET_REQUIRE_TRUSTED_PROXY", environment == "production")
 	if err != nil {
 		return nil, err
@@ -200,7 +192,6 @@ func Load() (*Config, error) {
 	}
 	return &Config{
 		Environment:                environment,
-		LegacyActiveTransport:      legacyTransport,
 		Port:                       port,
 		MongoURI:                   getEnv("MONGO_URI", "mongodb://root:dev2@mongodb:27017/dev2knowledge?authSource=admin"),
 		MongoDatabase:              getEnv("MONGO_DATABASE", "dev2knowledge"),

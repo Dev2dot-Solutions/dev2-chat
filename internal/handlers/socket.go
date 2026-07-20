@@ -564,7 +564,7 @@ func (c *socketConnection) handleChatSend(msg models.SocketClientMessage) {
 	for _, chunk := range chunkText(completed.result.answer, 200) {
 		c.sendEvent("content.delta", msg.RequestID, sessionID, map[string]any{"content": chunk})
 	}
-	meta := buildStreamMeta(sessionID, completed.result, completed.toolTrace, prepared.sources)
+	meta := buildSocketMeta(sessionID, completed.result, completed.toolTrace, prepared.sources)
 	c.sendEvent("chat.meta", msg.RequestID, sessionID, objectData(meta))
 	for _, approval := range completed.result.pendingApprovals {
 		c.sendEvent("approval.requested", msg.RequestID, sessionID, objectData(approval))

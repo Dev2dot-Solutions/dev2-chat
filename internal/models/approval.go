@@ -12,7 +12,7 @@ const (
 	ApprovalStatusExpired  = "expired"
 )
 
-// Approval decisions accepted by POST /chat/approvals/{approvalId}.
+// Approval decisions accepted by the WebSocket approval flow.
 const (
 	ApprovalDecisionApprove = "approve"
 	ApprovalDecisionReject  = "reject"
