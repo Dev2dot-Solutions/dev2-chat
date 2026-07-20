@@ -309,6 +309,22 @@ func (h *AgentHandler) lookupProject(r *http.Request, companyID, projectID strin
 	return nil, nil
 }
 
+func (h *AgentHandler) lookupProjectFresh(r *http.Request, companyID, projectID string) (*models.CompanyProject, error) {
+	if h.natsClient == nil {
+		return nil, fmt.Errorf("project lookup unavailable")
+	}
+	projects, err := h.natsClient.RequestCompanyProjectsFresh(companyID)
+	if err != nil {
+		return nil, err
+	}
+	for i := range projects {
+		if projects[i].ID == projectID {
+			return &projects[i], nil
+		}
+	}
+	return nil, nil
+}
+
 func (h *AgentHandler) searchKnowledge(r *http.Request, req models.ChatRequest) string {
 	if h.knowledgeRepo == nil {
 		return ""

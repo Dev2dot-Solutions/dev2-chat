@@ -244,16 +244,28 @@ func (c *Client) RequestLLMWithProgress(ctx context.Context, req *models.LLMRequ
 // dev2-company-config via company.projects.get request-reply. Results are
 // cached briefly (60s) since project/visibility changes are infrequent.
 func (c *Client) RequestCompanyProjects(companyID string) ([]models.CompanyProject, error) {
+	return c.requestCompanyProjects(companyID, false)
+}
+
+// RequestCompanyProjectsFresh bypasses the short project cache for
+// authorization decisions made on an already-open WebSocket.
+func (c *Client) RequestCompanyProjectsFresh(companyID string) ([]models.CompanyProject, error) {
+	return c.requestCompanyProjects(companyID, true)
+}
+
+func (c *Client) requestCompanyProjects(companyID string, fresh bool) ([]models.CompanyProject, error) {
 	if c.enc == nil {
 		return nil, fmt.Errorf("NATS not connected")
 	}
 
-	c.projectsMu.Lock()
-	if cp, ok := c.projectsCache[companyID]; ok && time.Now().Before(cp.expires) {
+	if !fresh {
+		c.projectsMu.Lock()
+		if cp, ok := c.projectsCache[companyID]; ok && time.Now().Before(cp.expires) {
+			c.projectsMu.Unlock()
+			return cp.projects, nil
+		}
 		c.projectsMu.Unlock()
-		return cp.projects, nil
 	}
-	c.projectsMu.Unlock()
 
 	var resp struct {
 		CompanyID string                  `json:"companyId"`

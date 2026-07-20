@@ -121,18 +121,25 @@ func main() {
 	)
 	settingsHandler := handlers.NewSettingsHandler(settingsRepo)
 	socketHandler := handlers.NewSocketHandler(socketRepo, agentHandler, chatHandler, handlers.SocketOptions{
-		AllowedOrigins: cfg.SocketAllowedOrigins,
-		SendQueue:      cfg.SocketSendQueue,
-		ReadLimit:      cfg.SocketReadLimit,
-		PingInterval:   cfg.SocketPingInterval,
-		IdleTimeout:    cfg.SocketIdleTimeout,
+		AllowedOrigins: cfg.SocketAllowedOrigins, SendQueue: cfg.SocketSendQueue, ReadLimit: cfg.SocketReadLimit,
+		PingInterval: cfg.SocketPingInterval, IdleTimeout: cfg.SocketIdleTimeout,
+		MaxLifetime: cfg.SocketMaxLifetime, DeveloperMaxLifetime: cfg.SocketDeveloperMaxLifetime,
+		ServiceMaxLifetime: cfg.SocketServiceMaxLifetime,
+		TicketPolicy:       repository.TicketPolicy{IssuePerMinute: cfg.SocketTicketRate, MaxOutstanding: cfg.SocketOutstandingTickets},
+		ConnectionPolicy: repository.ConnectionPolicy{
+			GlobalLimit: cfg.SocketConnectionsGlobal, CompanyLimit: cfg.SocketConnectionsCompany,
+			UserLimit: cfg.SocketConnectionsUser, IPLimit: cfg.SocketConnectionsIP, LeaseTTL: cfg.SocketConnectionLeaseTTL,
+		},
+		GenerationPolicy: repository.GenerationPolicy{
+			CompanyLimit: cfg.SocketGenerationsCompany, UserLimit: cfg.SocketGenerationsUser, LeaseTTL: cfg.SocketGenerationLeaseTTL,
+		},
+		MessagesPerMinute: cfg.SocketMessagesPerMinute, MessageBurst: cfg.SocketMessageBurst,
 	})
 
 	// Router
 	r := chi.NewRouter()
 	r.Use(chimw.RequestID)
 	r.Use(chimw.RealIP)
-	r.Use(handlers.SocketTicketRedactionMiddleware)
 	r.Use(chimw.Logger)
 	r.Use(chimw.Recoverer)
 	r.Use(func(next http.Handler) http.Handler {
@@ -145,14 +152,17 @@ func main() {
 		})
 	})
 	r.Use(cors.Handler(cors.Options{
-		AllowedOrigins:   cfg.SocketAllowedOrigins,
+		AllowedOrigins:   cfg.AllowedOrigins,
 		AllowedMethods:   []string{"GET", "POST", "PATCH", "DELETE", "OPTIONS"},
 		AllowedHeaders:   []string{"Accept", "Authorization", "Content-Type"},
 		ExposedHeaders:   []string{"Link"},
 		AllowCredentials: true,
 		MaxAge:           300,
 	}))
-	r.Use(handlers.AuthMiddleware)
+	r.Use(handlers.AuthMiddlewareWithOptions(handlers.AuthOptions{
+		Issuer: cfg.AuthentikIssuer, Audience: cfg.AuthentikAudience,
+		ServiceMaxLifetime: cfg.SocketServiceMaxLifetime,
+	}))
 
 	// Health
 	r.Get("/health", func(w http.ResponseWriter, r *http.Request) {

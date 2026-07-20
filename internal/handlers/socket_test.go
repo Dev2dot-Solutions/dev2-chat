@@ -2,6 +2,7 @@ package handlers
 
 import (
 	"context"
+	"encoding/base64"
 	"errors"
 	"fmt"
 	"net/http"
@@ -13,16 +14,20 @@ import (
 	"time"
 
 	"github.com/Dev2dot-Solutions/dev2-chat/internal/models"
+	"github.com/Dev2dot-Solutions/dev2-chat/internal/repository"
 	"github.com/gorilla/websocket"
 )
 
 type memorySocketStore struct {
-	mu       sync.Mutex
-	next     int
-	tickets  map[string]*models.SocketTicket
-	seq      map[string]int64
-	events   []storedSocketEvent
-	receipts map[string]*models.SocketActionReceipt
+	mu           sync.Mutex
+	next         int
+	tickets      map[string]*models.SocketTicket
+	seq          map[string]int64
+	events       []storedSocketEvent
+	receipts     map[string]*models.SocketActionReceipt
+	activeLeases int
+	maxLeases    int
+	consumeCalls int
 }
 
 type storedSocketEvent struct {
@@ -37,21 +42,24 @@ func newMemorySocketStore() *memorySocketStore {
 	}
 }
 
-func (s *memorySocketStore) IssueTicket(_ context.Context, identity models.SocketIdentity, now time.Time) (string, time.Time, error) {
+func (s *memorySocketStore) IssueTicket(_ context.Context, identity models.SocketIdentity, socketExpiresAt time.Time, _ repository.TicketPolicy, now time.Time) (string, time.Time, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.next++
-	token := fmt.Sprintf("ticket-%d", s.next)
+	raw := make([]byte, 32)
+	raw[len(raw)-1] = byte(s.next)
+	token := base64.RawURLEncoding.EncodeToString(raw)
 	expires := now.Add(30 * time.Second)
-	s.tickets[token] = &models.SocketTicket{SocketIdentity: identity, ExpiresAt: expires}
+	s.tickets[token] = &models.SocketTicket{SocketIdentity: identity, ExpiresAt: expires, SocketExpiresAt: socketExpiresAt}
 	return token, expires, nil
 }
 
 func (s *memorySocketStore) ConsumeTicket(_ context.Context, token string, now time.Time) (*models.SocketTicket, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	s.consumeCalls++
 	ticket := s.tickets[token]
-	if ticket == nil || ticket.ConsumedAt != nil || !ticket.ExpiresAt.After(now) {
+	if ticket == nil || ticket.ConsumedAt != nil || !ticket.ExpiresAt.After(now) || !ticket.SocketExpiresAt.After(now) {
 		return nil, nil
 	}
 	consumed := now.UTC()
@@ -64,7 +72,7 @@ func socketScope(identity models.SocketIdentity, sessionID string) string {
 	return identity.CompanyID + "\x00" + identity.UserID + "\x00" + sessionID
 }
 
-func (s *memorySocketStore) AppendEvent(_ context.Context, identity models.SocketIdentity, event models.SocketServerEvent) (*models.SocketServerEvent, error) {
+func (s *memorySocketStore) RecordEvent(_ context.Context, identity models.SocketIdentity, event models.SocketServerEvent) (*models.SocketServerEvent, bool, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	scope := socketScope(identity, event.SessionID)
@@ -74,10 +82,10 @@ func (s *memorySocketStore) AppendEvent(_ context.Context, identity models.Socke
 		event.Timestamp = time.Now().UTC()
 	}
 	s.events = append(s.events, storedSocketEvent{identity: identity, event: event})
-	return &event, nil
+	return &event, true, nil
 }
 
-func (s *memorySocketStore) ReplayEvents(_ context.Context, identity models.SocketIdentity, sessionID string, afterSeq int64) ([]models.SocketServerEvent, error) {
+func (s *memorySocketStore) ReplayEvents(_ context.Context, identity models.SocketIdentity, sessionID string, afterSeq int64) (*models.SocketReplay, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	var result []models.SocketServerEvent
@@ -87,24 +95,34 @@ func (s *memorySocketStore) ReplayEvents(_ context.Context, identity models.Sock
 			result = append(result, stored.event)
 		}
 	}
-	return result, nil
+	latest := s.seq[socketScope(identity, sessionID)]
+	earliest := int64(0)
+	if len(result) > 0 {
+		earliest = result[0].Seq
+	}
+	return &models.SocketReplay{Events: result, EarliestAvailableSeq: earliest, LatestSeq: latest}, nil
 }
 
 func receiptKey(identity models.SocketIdentity, key string) string {
 	return identity.CompanyID + "\x00" + identity.UserID + "\x00" + key
 }
 
-func (s *memorySocketStore) BeginReceipt(_ context.Context, identity models.SocketIdentity, key, actionType, requestID string, now time.Time) (*models.SocketActionReceipt, bool, error) {
+func (s *memorySocketStore) BeginReceipt(_ context.Context, binding models.SocketActionBinding, requestID string, now time.Time) (*models.SocketActionReceipt, bool, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	id := receiptKey(identity, key)
+	identity := models.SocketIdentity{CompanyID: binding.CompanyID, UserID: binding.UserID}
+	id := receiptKey(identity, binding.IdempotencyKey)
 	if receipt := s.receipts[id]; receipt != nil {
 		copy := *receipt
+		if receipt.AccessProfile != binding.AccessProfile || receipt.ProjectID != binding.ProjectID || receipt.BoundSessionID != binding.SessionID || receipt.ActionType != binding.ActionType || receipt.PayloadHash != binding.PayloadHash {
+			return &copy, false, repository.ErrSocketReceiptMismatch
+		}
 		return &copy, false, nil
 	}
 	receipt := &models.SocketActionReceipt{
 		ID: id, CompanyID: identity.CompanyID, UserID: identity.UserID,
-		ActionType: actionType, RequestID: requestID, State: "processing",
+		AccessProfile: binding.AccessProfile, ProjectID: binding.ProjectID, BoundSessionID: binding.SessionID,
+		ActionType: binding.ActionType, PayloadHash: binding.PayloadHash, RequestID: requestID, State: "claimed",
 		CreatedAt: now, UpdatedAt: now, ExpiresAt: now.Add(24 * time.Hour),
 	}
 	s.receipts[id] = receipt
@@ -112,10 +130,11 @@ func (s *memorySocketStore) BeginReceipt(_ context.Context, identity models.Sock
 	return &copy, true, nil
 }
 
-func (s *memorySocketStore) UpdateReceipt(_ context.Context, identity models.SocketIdentity, key, state, sessionID, finalType string, data map[string]any) error {
+func (s *memorySocketStore) UpdateReceipt(_ context.Context, binding models.SocketActionBinding, state, sessionID, finalType string, data map[string]any) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	receipt := s.receipts[receiptKey(identity, key)]
+	identity := models.SocketIdentity{CompanyID: binding.CompanyID, UserID: binding.UserID}
+	receipt := s.receipts[receiptKey(identity, binding.IdempotencyKey)]
 	if receipt == nil {
 		return errors.New("receipt not found")
 	}
@@ -123,11 +142,48 @@ func (s *memorySocketStore) UpdateReceipt(_ context.Context, identity models.Soc
 	return nil
 }
 
+func (s *memorySocketStore) AcquireConnection(_ context.Context, _ models.SocketIdentity, _ string, policy repository.ConnectionPolicy, now time.Time) (*models.SocketLease, error) {
+	return s.acquireLease(policy.GlobalLimit, policy.LeaseTTL, now)
+}
+
+func (s *memorySocketStore) AcquireGeneration(_ context.Context, _ models.SocketIdentity, policy repository.GenerationPolicy, now time.Time) (*models.SocketLease, error) {
+	return s.acquireLease(policy.UserLimit, policy.LeaseTTL, now)
+}
+
+func (s *memorySocketStore) acquireLease(limit int, ttl time.Duration, now time.Time) (*models.SocketLease, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.maxLeases > 0 {
+		limit = s.maxLeases
+	}
+	if s.activeLeases >= limit {
+		return nil, repository.ErrSocketCapacity
+	}
+	s.activeLeases++
+	return &models.SocketLease{ConnectionID: fmt.Sprintf("lease-%d", s.activeLeases), LeaseIDs: []string{"slot"}, ExpiresAt: now.Add(ttl)}, nil
+}
+
+func (s *memorySocketStore) RenewLease(_ context.Context, lease *models.SocketLease, ttl time.Duration, now time.Time) error {
+	lease.ExpiresAt = now.Add(ttl)
+	return nil
+}
+
+func (s *memorySocketStore) ReleaseLease(_ context.Context, lease *models.SocketLease) {
+	if lease == nil {
+		return
+	}
+	s.mu.Lock()
+	if s.activeLeases > 0 {
+		s.activeLeases--
+	}
+	s.mu.Unlock()
+}
+
 func TestSocketTicketExpiresAndIsConsumedOnceAtomically(t *testing.T) {
 	store := newMemorySocketStore()
 	identity := models.SocketIdentity{UserID: "user-1", CompanyID: "company-1"}
 	now := time.Now().UTC()
-	token, expires, err := store.IssueTicket(context.Background(), identity, now)
+	token, expires, err := store.IssueTicket(context.Background(), identity, now.Add(time.Hour), repository.TicketPolicy{}, now)
 	if err != nil || expires.Sub(now) != 30*time.Second {
 		t.Fatalf("issue ticket: expires=%v err=%v", expires, err)
 	}
@@ -146,7 +202,7 @@ func TestSocketTicketExpiresAndIsConsumedOnceAtomically(t *testing.T) {
 	if successes.Load() != 1 {
 		t.Fatalf("expected exactly one atomic consume, got %d", successes.Load())
 	}
-	expired, _, _ := store.IssueTicket(context.Background(), identity, now)
+	expired, _, _ := store.IssueTicket(context.Background(), identity, now.Add(time.Hour), repository.TicketPolicy{}, now)
 	if ticket, _ := store.ConsumeTicket(context.Background(), expired, now.Add(31*time.Second)); ticket != nil {
 		t.Fatal("expired ticket was consumed")
 	}
@@ -155,14 +211,15 @@ func TestSocketTicketExpiresAndIsConsumedOnceAtomically(t *testing.T) {
 func TestSocketOriginRejectedWithoutConsumingTicket(t *testing.T) {
 	store := newMemorySocketStore()
 	identity := models.SocketIdentity{UserID: "user-1", CompanyID: "company-1", AccessProfile: "client", ProjectID: "project-1"}
-	token, _, _ := store.IssueTicket(context.Background(), identity, time.Now())
+	token, _, _ := store.IssueTicket(context.Background(), identity, time.Now().Add(time.Hour), repository.TicketPolicy{}, time.Now())
 	handler := NewSocketHandler(store, nil, nil, SocketOptions{AllowedOrigins: []string{"https://dev2.solutions"}})
-	server := httptest.NewServer(SocketTicketRedactionMiddleware(http.HandlerFunc(handler.Connect)))
+	server := httptest.NewServer(http.HandlerFunc(handler.Connect))
 	defer server.Close()
-	wsURL := "ws" + strings.TrimPrefix(server.URL, "http") + "/chat/ws?ticket=" + token
+	wsURL := "ws" + strings.TrimPrefix(server.URL, "http") + "/chat/ws"
+	dialer := websocket.Dialer{Subprotocols: []string{baseProtocol, ticketProtocolPrefix + token}}
 
 	badHeader := http.Header{"Origin": []string{"https://evil.example"}}
-	if conn, resp, err := websocket.DefaultDialer.Dial(wsURL, badHeader); err == nil {
+	if conn, resp, err := dialer.Dial(wsURL, badHeader); err == nil {
 		conn.Close()
 		t.Fatal("unexpected successful connection from rejected origin")
 	} else if resp == nil || resp.StatusCode != http.StatusForbidden {
@@ -170,7 +227,7 @@ func TestSocketOriginRejectedWithoutConsumingTicket(t *testing.T) {
 	}
 
 	goodHeader := http.Header{"Origin": []string{"https://dev2.solutions"}}
-	conn, _, err := websocket.DefaultDialer.Dial(wsURL, goodHeader)
+	conn, _, err := dialer.Dial(wsURL, goodHeader)
 	if err != nil {
 		t.Fatalf("allowed origin could not use unconsumed ticket: %v", err)
 	}
@@ -178,9 +235,12 @@ func TestSocketOriginRejectedWithoutConsumingTicket(t *testing.T) {
 	if err := conn.ReadJSON(&ready); err != nil || ready.Type != "connection.ready" {
 		t.Fatalf("expected connection.ready, event=%#v err=%v", ready, err)
 	}
+	if conn.Subprotocol() != baseProtocol {
+		t.Fatalf("server echoed unsafe subprotocol %q", conn.Subprotocol())
+	}
 	conn.Close()
 
-	if conn, resp, err := websocket.DefaultDialer.Dial(wsURL, goodHeader); err == nil {
+	if conn, resp, err := dialer.Dial(wsURL, goodHeader); err == nil {
 		conn.Close()
 		t.Fatal("consumed ticket connected twice")
 	} else if resp == nil || resp.StatusCode != http.StatusUnauthorized {
@@ -188,19 +248,161 @@ func TestSocketOriginRejectedWithoutConsumingTicket(t *testing.T) {
 	}
 }
 
+func TestSocketRequiresTicketSubprotocolAndRejectsQueryBeforeConsume(t *testing.T) {
+	store := newMemorySocketStore()
+	identity := models.SocketIdentity{UserID: "u", CompanyID: "c", AccessProfile: "client", ProjectID: "p"}
+	token, _, _ := store.IssueTicket(context.Background(), identity, time.Now().Add(time.Hour), repository.TicketPolicy{}, time.Now())
+	handler := NewSocketHandler(store, nil, nil, SocketOptions{AllowedOrigins: []string{"https://dev2.solutions"}})
+
+	queryRequest := httptest.NewRequest(http.MethodGet, "/chat/ws?ticket="+token, nil)
+	queryRequest.Header.Set("Origin", "https://dev2.solutions")
+	queryResponse := httptest.NewRecorder()
+	handler.Connect(queryResponse, queryRequest)
+	if queryResponse.Code != http.StatusBadRequest || store.consumeCalls != 0 {
+		t.Fatalf("query ticket reached storage: status=%d consumes=%d", queryResponse.Code, store.consumeCalls)
+	}
+
+	missingRequest := httptest.NewRequest(http.MethodGet, "/chat/ws", nil)
+	missingRequest.Header.Set("Origin", "https://dev2.solutions")
+	missingResponse := httptest.NewRecorder()
+	handler.Connect(missingResponse, missingRequest)
+	if missingResponse.Code != http.StatusUnauthorized || store.consumeCalls != 0 {
+		t.Fatalf("missing protocol reached storage: status=%d consumes=%d", missingResponse.Code, store.consumeCalls)
+	}
+
+	for _, header := range []string{
+		baseProtocol + ", " + ticketProtocolPrefix + "short",
+		baseProtocol + ", " + ticketProtocolPrefix + token + ", extra",
+		strings.Repeat("x", 513),
+	} {
+		if _, err := extractSocketTicketProtocol([]string{header}); err == nil {
+			t.Fatalf("malformed protocol accepted: %q", header)
+		}
+	}
+}
+
+func TestSocketClosesAtAuthorizationExpiry(t *testing.T) {
+	store := newMemorySocketStore()
+	now := time.Now()
+	identity := models.SocketIdentity{UserID: "u", CompanyID: "c", AccessProfile: "client", ProjectID: "p", AuthExpiresAt: now.Add(time.Minute)}
+	token, _, _ := store.IssueTicket(context.Background(), identity, now.Add(200*time.Millisecond), repository.TicketPolicy{}, now)
+	handler := NewSocketHandler(store, nil, nil, SocketOptions{AllowedOrigins: []string{"https://dev2.solutions"}, PingInterval: time.Second})
+	server := httptest.NewServer(http.HandlerFunc(handler.Connect))
+	defer server.Close()
+	dialer := websocket.Dialer{Subprotocols: []string{baseProtocol, ticketProtocolPrefix + token}}
+	conn, _, err := dialer.Dial("ws"+strings.TrimPrefix(server.URL, "http")+"/chat/ws", http.Header{"Origin": []string{"https://dev2.solutions"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn.Close()
+	var ready models.SocketServerEvent
+	if err := conn.ReadJSON(&ready); err != nil || ready.Data["authExpiresAt"] == nil {
+		t.Fatalf("missing auth expiry in ready event: %#v err=%v", ready, err)
+	}
+	_, _, err = conn.ReadMessage()
+	var closeErr *websocket.CloseError
+	if !errors.As(err, &closeErr) || closeErr.Code != socketCloseAuth {
+		t.Fatalf("expected auth close %d, got %v", socketCloseAuth, err)
+	}
+}
+
+func TestSocketUsesRateAndForbiddenCloseCodes(t *testing.T) {
+	t.Run("rate", func(t *testing.T) {
+		store := newMemorySocketStore()
+		now := time.Now()
+		identity := models.SocketIdentity{UserID: "u", CompanyID: "c", AccessProfile: "client", ProjectID: "p", AuthExpiresAt: now.Add(time.Hour)}
+		token, _, _ := store.IssueTicket(context.Background(), identity, now.Add(time.Hour), repository.TicketPolicy{}, now)
+		handler := NewSocketHandler(store, nil, nil, SocketOptions{
+			AllowedOrigins: []string{"https://dev2.solutions"}, MessageBurst: 1, MessagesPerMinute: 1,
+		})
+		server := httptest.NewServer(http.HandlerFunc(handler.Connect))
+		defer server.Close()
+		dialer := websocket.Dialer{Subprotocols: []string{baseProtocol, ticketProtocolPrefix + token}}
+		conn, _, err := dialer.Dial("ws"+strings.TrimPrefix(server.URL, "http")+"/chat/ws", http.Header{"Origin": []string{"https://dev2.solutions"}})
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer conn.Close()
+		var ready models.SocketServerEvent
+		if err := conn.ReadJSON(&ready); err != nil {
+			t.Fatal(err)
+		}
+		message := map[string]any{"type": "generation.cancel", "data": map[string]any{"targetRequestId": "missing"}}
+		if err := conn.WriteJSON(message); err != nil {
+			t.Fatal(err)
+		}
+		var response models.SocketServerEvent
+		if err := conn.ReadJSON(&response); err != nil || response.Type != "error" {
+			t.Fatalf("first action failed: %#v %v", response, err)
+		}
+		if err := conn.WriteJSON(map[string]any{"type": "ping", "data": map[string]any{}}); err != nil {
+			t.Fatal(err)
+		}
+		if err := conn.ReadJSON(&response); err != nil || response.Type != "pong" {
+			t.Fatalf("ping consumed action capacity: %#v %v", response, err)
+		}
+		store.mu.Lock()
+		persistedEvents := len(store.events)
+		store.mu.Unlock()
+		if persistedEvents != 0 {
+			t.Fatalf("routine error/ping events were persisted: %d", persistedEvents)
+		}
+		if err := conn.WriteJSON(message); err != nil {
+			t.Fatal(err)
+		}
+		_, _, err = conn.ReadMessage()
+		var closeErr *websocket.CloseError
+		if !errors.As(err, &closeErr) || closeErr.Code != socketCloseRate {
+			t.Fatalf("expected 4429, got %v", err)
+		}
+	})
+
+	t.Run("forbidden", func(t *testing.T) {
+		store := newMemorySocketStore()
+		now := time.Now()
+		identity := models.SocketIdentity{UserID: "u", CompanyID: "c", IsAdmin: false, AccessProfile: "developer", ProjectID: "p", AuthExpiresAt: now.Add(time.Hour)}
+		token, _, _ := store.IssueTicket(context.Background(), identity, now.Add(time.Hour), repository.TicketPolicy{}, now)
+		handler := NewSocketHandler(store, &AgentHandler{}, nil, SocketOptions{AllowedOrigins: []string{"https://dev2.solutions"}})
+		server := httptest.NewServer(http.HandlerFunc(handler.Connect))
+		defer server.Close()
+		dialer := websocket.Dialer{Subprotocols: []string{baseProtocol, ticketProtocolPrefix + token}}
+		conn, _, err := dialer.Dial("ws"+strings.TrimPrefix(server.URL, "http")+"/chat/ws", http.Header{"Origin": []string{"https://dev2.solutions"}})
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer conn.Close()
+		var ready models.SocketServerEvent
+		if err := conn.ReadJSON(&ready); err != nil {
+			t.Fatal(err)
+		}
+		if err := conn.WriteJSON(map[string]any{
+			"type": "chat.send", "requestId": "r", "idempotencyKey": "k",
+			"data": map[string]any{"message": "hello", "projectId": "p", "accessProfile": "developer"},
+		}); err != nil {
+			t.Fatal(err)
+		}
+		_, _, err = conn.ReadMessage()
+		var closeErr *websocket.CloseError
+		if !errors.As(err, &closeErr) || closeErr.Code != socketCloseForbidden {
+			t.Fatalf("expected 4403, got %v", err)
+		}
+	})
+}
+
 func TestSocketHeartbeatSendsControlPing(t *testing.T) {
 	store := newMemorySocketStore()
 	identity := models.SocketIdentity{UserID: "user-1", CompanyID: "company-1", AccessProfile: "client", ProjectID: "project-1"}
-	token, _, _ := store.IssueTicket(context.Background(), identity, time.Now())
+	token, _, _ := store.IssueTicket(context.Background(), identity, time.Now().Add(time.Hour), repository.TicketPolicy{}, time.Now())
 	handler := NewSocketHandler(store, nil, nil, SocketOptions{
 		AllowedOrigins: []string{"https://dev2.solutions"},
 		PingInterval:   10 * time.Millisecond,
 		IdleTimeout:    time.Second,
 	})
-	server := httptest.NewServer(SocketTicketRedactionMiddleware(http.HandlerFunc(handler.Connect)))
+	server := httptest.NewServer(http.HandlerFunc(handler.Connect))
 	defer server.Close()
-	wsURL := "ws" + strings.TrimPrefix(server.URL, "http") + "/chat/ws?ticket=" + token
-	conn, _, err := websocket.DefaultDialer.Dial(wsURL, http.Header{"Origin": []string{"https://dev2.solutions"}})
+	wsURL := "ws" + strings.TrimPrefix(server.URL, "http") + "/chat/ws"
+	dialer := websocket.Dialer{Subprotocols: []string{baseProtocol, ticketProtocolPrefix + token}}
+	conn, _, err := dialer.Dial(wsURL, http.Header{"Origin": []string{"https://dev2.solutions"}})
 	if err != nil {
 		t.Fatalf("connect: %v", err)
 	}
@@ -258,7 +460,8 @@ func TestActionReceiptsAreIdempotentForSendAndApproval(t *testing.T) {
 				wg.Add(1)
 				go func(i int) {
 					defer wg.Done()
-					_, isNew, err := store.BeginReceipt(context.Background(), identity, "same-key", action, fmt.Sprintf("r%d", i), time.Now())
+					binding := models.SocketActionBinding{CompanyID: identity.CompanyID, UserID: identity.UserID, AccessProfile: "client", ProjectID: "p", ActionType: action, PayloadHash: "hash", IdempotencyKey: "same-key"}
+					_, isNew, err := store.BeginReceipt(context.Background(), binding, fmt.Sprintf("r%d", i), time.Now())
 					if err != nil {
 						t.Errorf("begin receipt: %v", err)
 					}
@@ -275,22 +478,75 @@ func TestActionReceiptsAreIdempotentForSendAndApproval(t *testing.T) {
 	}
 }
 
+func TestReceiptBindingMismatchIsRejected(t *testing.T) {
+	store := newMemorySocketStore()
+	base := models.SocketActionBinding{
+		CompanyID: "c", UserID: "u", AccessProfile: "developer", ProjectID: "p1",
+		SessionID: "s1", ActionType: models.SocketActionChatSend, PayloadHash: "payload-1", IdempotencyKey: "key",
+	}
+	if _, created, err := store.BeginReceipt(context.Background(), base, "r1", time.Now()); err != nil || !created {
+		t.Fatalf("create receipt: created=%v err=%v", created, err)
+	}
+	mutations := []models.SocketActionBinding{
+		func() models.SocketActionBinding { value := base; value.AccessProfile = "client"; return value }(),
+		func() models.SocketActionBinding { value := base; value.ProjectID = "p2"; return value }(),
+		func() models.SocketActionBinding { value := base; value.SessionID = "s2"; return value }(),
+		func() models.SocketActionBinding {
+			value := base
+			value.ActionType = models.SocketActionApprovalDecide
+			return value
+		}(),
+		func() models.SocketActionBinding { value := base; value.PayloadHash = "payload-2"; return value }(),
+	}
+	for _, mutation := range mutations {
+		if _, _, err := store.BeginReceipt(context.Background(), mutation, "r2", time.Now()); !errors.Is(err, repository.ErrSocketReceiptMismatch) {
+			t.Fatalf("binding mismatch accepted: %#v err=%v", mutation, err)
+		}
+	}
+}
+
+func TestConnectionLeaseAndMessageBucketLimits(t *testing.T) {
+	store := newMemorySocketStore()
+	store.maxLeases = 1
+	policy := repository.ConnectionPolicy{GlobalLimit: 10, LeaseTTL: time.Minute}
+	first, err := store.AcquireConnection(context.Background(), models.SocketIdentity{}, "127.0.0.1", policy, time.Now())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.AcquireConnection(context.Background(), models.SocketIdentity{}, "127.0.0.1", policy, time.Now()); !errors.Is(err, repository.ErrSocketCapacity) {
+		t.Fatalf("connection capacity not enforced: %v", err)
+	}
+	store.ReleaseLease(context.Background(), first)
+	if _, err := store.AcquireConnection(context.Background(), models.SocketIdentity{}, "127.0.0.1", policy, time.Now()); err != nil {
+		t.Fatalf("released lease was not reusable: %v", err)
+	}
+
+	now := time.Now()
+	bucket := newTokenBucket(2, 60, now)
+	if !bucket.Allow(now) || !bucket.Allow(now) || bucket.Allow(now) {
+		t.Fatal("token bucket burst was not enforced")
+	}
+	if !bucket.Allow(now.Add(time.Second)) {
+		t.Fatal("token bucket did not refill")
+	}
+}
+
 func TestSocketSequenceAndReplayAuthorization(t *testing.T) {
 	store := newMemorySocketStore()
 	owner := models.SocketIdentity{UserID: "u1", CompanyID: "c1"}
 	otherUser := models.SocketIdentity{UserID: "u2", CompanyID: "c1"}
 	for i := 0; i < 3; i++ {
-		event, err := store.AppendEvent(context.Background(), owner, models.SocketServerEvent{Type: "trace", SessionID: "s1", Data: map[string]any{}})
+		event, _, err := store.RecordEvent(context.Background(), owner, models.SocketServerEvent{Type: "trace", SessionID: "s1", Data: map[string]any{}})
 		if err != nil || event.Seq != int64(i+1) {
 			t.Fatalf("event %d sequence=%v err=%v", i, event.Seq, err)
 		}
 	}
 	replayed, _ := store.ReplayEvents(context.Background(), owner, "s1", 1)
-	if len(replayed) != 2 || replayed[0].Seq != 2 || replayed[1].Seq != 3 {
+	if len(replayed.Events) != 2 || replayed.Events[0].Seq != 2 || replayed.Events[1].Seq != 3 {
 		t.Fatalf("unexpected replay: %#v", replayed)
 	}
 	unauthorized, _ := store.ReplayEvents(context.Background(), otherUser, "s1", 0)
-	if len(unauthorized) != 0 {
+	if len(unauthorized.Events) != 0 {
 		t.Fatalf("other user replayed owner events: %#v", unauthorized)
 	}
 }
@@ -329,8 +585,36 @@ func TestSocketBackpressureClosesAndCancellationTargetsGeneration(t *testing.T) 
 	if connection.enqueue(models.SocketServerEvent{Type: "trace"}) {
 		t.Fatal("full queue accepted another event")
 	}
-	if connection.closeCode != websocket.ClosePolicyViolation || connection.closeText != socketCloseSlow {
+	if connection.closeCode != socketCloseBusy || connection.closeText != socketCloseSlow {
 		t.Fatalf("unexpected backpressure close: %d %q", connection.closeCode, connection.closeText)
+	}
+}
+
+func TestTerminalStatusPersistsAfterDisconnect(t *testing.T) {
+	store := newMemorySocketStore()
+	binding := models.SocketActionBinding{
+		CompanyID: "c", UserID: "u", AccessProfile: "client", ProjectID: "p",
+		SessionID: "s", ActionType: models.SocketActionChatSend, PayloadHash: "hash", IdempotencyKey: "key",
+	}
+	if _, _, err := store.BeginReceipt(context.Background(), binding, "request", time.Now()); err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	connection := &socketConnection{
+		handler: &SocketHandler{store: store}, identity: models.SocketIdentity{CompanyID: "c", UserID: "u"},
+		ctx: ctx, cancel: cancel, send: make(chan models.SocketServerEvent, 1), generations: make(map[string]context.CancelFunc),
+	}
+	connection.persistTerminal(binding, "cancelled", "generation.cancelled", "request", "s", map[string]any{"status": "cancelled"})
+	store.mu.Lock()
+	receipt := store.receipts[receiptKey(models.SocketIdentity{CompanyID: "c", UserID: "u"}, "key")]
+	eventCount := len(store.events)
+	store.mu.Unlock()
+	if receipt.State != "cancelled" || receipt.FinalEventType != "generation.cancelled" || eventCount != 1 {
+		t.Fatalf("terminal state not persisted after disconnect: receipt=%#v events=%d", receipt, eventCount)
+	}
+	if len(connection.send) != 0 {
+		t.Fatal("disconnected connection was sent a terminal event")
 	}
 }
 

@@ -8,6 +8,11 @@ services:
     environment:
       MONGO_URI: mongodb://${MONGO_USER:-root}:${MONGO_PASSWORD:-dev2}@mongodb:27017/${MONGO_DATABASE:-dev2knowledge}?authSource=${MONGO_AUTH_SOURCE:-admin}
       NATS_URL: nats://nats:4223
+      ENVIRONMENT: ${ENVIRONMENT:-production}
+      AUTHENTIK_ISSUER: ${AUTHENTIK_ISSUER:-}
+      AUTHENTIK_AUDIENCE: ${AUTHENTIK_AUDIENCE:-}
+      CHAT_ALLOWED_ORIGINS: ${CHAT_ALLOWED_ORIGINS:-https://dev2.solutions}
+      CHAT_SOCKET_ALLOWED_ORIGINS: ${CHAT_SOCKET_ALLOWED_ORIGINS:-https://dev2.solutions}
     networks:
       - dev2-network
     restart: unless-stopped

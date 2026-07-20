@@ -37,7 +37,7 @@ func (r *MessageRepo) ListBySession(ctx context.Context, sessionID string, limit
 		limit = 50
 	}
 	cursor, err := r.coll.Find(ctx, bson.M{"sessionId": sessionID},
-		options.Find().SetSort(bson.M{"createdAt": 1}).SetLimit(int64(limit)))
+		options.Find().SetSort(bson.M{"createdAt": -1}).SetLimit(int64(limit)))
 	if err != nil {
 		return nil, fmt.Errorf("find messages: %w", err)
 	}
@@ -50,7 +50,14 @@ func (r *MessageRepo) ListBySession(ctx context.Context, sessionID string, limit
 	if messages == nil {
 		messages = []models.ChatMessage{}
 	}
+	reverseMessages(messages)
 	return messages, nil
+}
+
+func reverseMessages(messages []models.ChatMessage) {
+	for left, right := 0, len(messages)-1; left < right; left, right = left+1, right-1 {
+		messages[left], messages[right] = messages[right], messages[left]
+	}
 }
 
 func (r *MessageRepo) CountBySession(ctx context.Context, sessionID string) (int, error) {

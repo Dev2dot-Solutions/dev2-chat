@@ -2,6 +2,7 @@ package repository
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"time"
 
@@ -58,6 +59,41 @@ func (r *SessionRepo) GetByID(ctx context.Context, id string) (*models.ChatSessi
 	}
 	if err != nil {
 		return nil, fmt.Errorf("get session: %w", err)
+	}
+	return &session, nil
+}
+
+// BindLegacyProject atomically assigns the first authorized project to a
+// legacy session whose projectId is empty/missing. Concurrent continuations
+// cannot bind the same session to different projects.
+func (r *SessionRepo) BindLegacyProject(ctx context.Context, id, companyID, userID, profile, projectID string) (*models.ChatSession, error) {
+	profileFilter := bson.A{bson.M{"accessProfile": profile}}
+	if profile == models.AccessProfileClient {
+		profileFilter = append(profileFilter, bson.M{"accessProfile": ""}, bson.M{"accessProfile": bson.M{"$exists": false}})
+	}
+	filter := bson.M{
+		"_id": id, "companyId": companyID, "userId": userID,
+		"$and": bson.A{
+			bson.M{"$or": bson.A{bson.M{"projectId": ""}, bson.M{"projectId": bson.M{"$exists": false}}}},
+			bson.M{"$or": profileFilter},
+		},
+	}
+	var session models.ChatSession
+	err := r.coll.FindOneAndUpdate(ctx, filter, bson.M{"$set": bson.M{"projectId": projectID, "updatedAt": time.Now().UTC()}},
+		options.FindOneAndUpdate().SetReturnDocument(options.After)).Decode(&session)
+	if errors.Is(err, mongo.ErrNoDocuments) {
+		// A concurrent caller may have completed the same binding.
+		existing, getErr := r.GetByID(ctx, id)
+		if getErr != nil {
+			return nil, getErr
+		}
+		if existing == nil || existing.ProjectID != projectID {
+			return nil, fmt.Errorf("legacy session project already bound")
+		}
+		return existing, nil
+	}
+	if err != nil {
+		return nil, fmt.Errorf("bind legacy session project: %w", err)
 	}
 	return &session, nil
 }
