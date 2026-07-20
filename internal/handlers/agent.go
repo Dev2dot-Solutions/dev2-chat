@@ -448,6 +448,9 @@ func (h *AgentHandler) recordPendingApprovals(r *http.Request, session *models.C
 // its final result over channels so NATS callbacks can never write SSE data
 // concurrently.
 func (h *AgentHandler) streamAnswer(w http.ResponseWriter, r *http.Request, session *models.ChatSession, llmReq *models.LLMRequest, req models.ChatRequest, profile string, project *models.CompanyProject, actorUserID string, sources []models.Source) {
+	if r.Context().Err() != nil {
+		return
+	}
 	flusher, ok := w.(http.Flusher)
 	if !ok {
 		respondError(w, http.StatusInternalServerError, "streaming not supported")
@@ -467,6 +470,9 @@ func (h *AgentHandler) streamAnswer(w http.ResponseWriter, r *http.Request, sess
 			if !models.IsToolTraceEvent(event) {
 				return
 			}
+			if r.Context().Err() != nil {
+				return
+			}
 			select {
 			case progressCh <- event:
 			case <-r.Context().Done():
@@ -482,17 +488,26 @@ func (h *AgentHandler) streamAnswer(w http.ResponseWriter, r *http.Request, sess
 	for {
 		select {
 		case event := <-progressCh:
+			if r.Context().Err() != nil {
+				return
+			}
 			progress = append(progress, event)
 			if err := writeSSEJSON(w, flusher, "trace", event); err != nil {
 				return
 			}
 		case result := <-resultCh:
+			if r.Context().Err() != nil {
+				return
+			}
 			// processLLMResponse sends its result only after every progress
 			// callback has completed, so all remaining events are now buffered.
 		drainProgress:
 			for {
 				select {
 				case event := <-progressCh:
+					if r.Context().Err() != nil {
+						return
+					}
 					progress = append(progress, event)
 					if err := writeSSEJSON(w, flusher, "trace", event); err != nil {
 						return
@@ -505,11 +520,20 @@ func (h *AgentHandler) streamAnswer(w http.ResponseWriter, r *http.Request, sess
 			toolTrace := models.NormalizeToolTrace(progress)
 			h.finishAsk(r, session, req, actorUserID, result, toolTrace)
 			for _, chunk := range chunkText(result.answer, 200) {
+				if r.Context().Err() != nil {
+					return
+				}
 				if err := writeSSEJSON(w, flusher, "chunk", map[string]string{"content": chunk}); err != nil {
 					return
 				}
 			}
+			if r.Context().Err() != nil {
+				return
+			}
 			if err := writeSSEJSON(w, flusher, "meta", buildStreamMeta(session.ID, result, toolTrace, sources)); err != nil {
+				return
+			}
+			if r.Context().Err() != nil {
 				return
 			}
 			if _, err := fmt.Fprint(w, "event: done\ndata: [DONE]\n\n"); err != nil {

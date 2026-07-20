@@ -23,6 +23,8 @@ const (
 	SubjectToolAudit          = "audit.tool.invocation"
 	companyProjectsCacheTTL   = 60 * time.Second
 	toolApproveTimeout        = 10 * time.Second
+	cancelReadinessWait       = 5 * time.Second
+	cancelFlushTimeout        = 2 * time.Second
 )
 
 // Client manages NATS connections for dev2-chat.
@@ -114,7 +116,12 @@ func (c *Client) RequestLLMWithProgress(ctx context.Context, req *models.LLMRequ
 	if err != nil {
 		return nil, fmt.Errorf("subscribe to llm progress: %w", err)
 	}
-	defer progressSub.Unsubscribe()
+	progressOwned := true
+	defer func() {
+		if progressOwned {
+			progressSub.Unsubscribe()
+		}
+	}()
 	// Flush guarantees the server has registered the inbox before llm.request
 	// can emit its first progress event.
 	if err := c.nc.FlushTimeout(5 * time.Second); err != nil {
@@ -156,27 +163,41 @@ func (c *Client) RequestLLMWithProgress(ctx context.Context, req *models.LLMRequ
 		msg, requestErr := c.nc.RequestWithContext(requestCtx, fmt.Sprintf("%s.%s", SubjectLLMRequest, sessionID), payload)
 		resultCh <- requestResult{msg: msg, err: requestErr}
 	}()
-	cancelPublished := false
-	publishCancel := func() {
-		if cancelPublished {
-			return
-		}
-		cancelPublished = true
+	cancellation := newRequestCancellationState(func() {
 		if err := c.nc.Publish(cancelSubject, []byte(`{}`)); err != nil {
 			log.Printf("[nats] Failed to publish llm cancellation: %v", err)
 		}
+		if err := c.nc.FlushTimeout(cancelFlushTimeout); err != nil {
+			log.Printf("[nats] Failed to flush llm cancellation: %v", err)
+		}
+	})
+	handoffCancellation := func() {
+		if cancellation.requestCancel() {
+			return
+		}
+		// The HTTP request may now return, but this goroutine owns the progress
+		// subscription until request_started arrives or the bounded wait ends.
+		progressOwned = false
+		go func() {
+			defer progressSub.Unsubscribe()
+			readyCtx, readyCancel := context.WithTimeout(context.Background(), cancelReadinessWait)
+			defer readyCancel()
+			awaitRequestStarted(readyCtx, progressMessages, cancellation)
+		}()
 	}
 
 	forwardProgress := func(msg *nats.Msg) {
-		if onProgress == nil {
-			return
-		}
 		var event models.ToolTraceEvent
 		if err := json.Unmarshal(msg.Data, &event); err != nil {
 			log.Printf("[nats] Ignoring invalid llm progress event: %v", err)
 			return
 		}
-		onProgress(event)
+		if isRequestStarted(event.Type) {
+			cancellation.observeReady()
+		}
+		if onProgress != nil {
+			onProgress(event)
+		}
 	}
 
 	for {
@@ -184,6 +205,10 @@ func (c *Client) RequestLLMWithProgress(ctx context.Context, req *models.LLMRequ
 		case msg := <-progressMessages:
 			forwardProgress(msg)
 		case result := <-resultCh:
+			if requestCtx.Err() != nil {
+				handoffCancellation()
+				return nil, fmt.Errorf("llm.request failed: %w", requestCtx.Err())
+			}
 			// The NATS connection dispatches messages in wire order. Drain any
 			// progress already delivered before processing the final reply.
 			for {
@@ -191,9 +216,13 @@ func (c *Client) RequestLLMWithProgress(ctx context.Context, req *models.LLMRequ
 				case msg := <-progressMessages:
 					forwardProgress(msg)
 				default:
+					if requestCtx.Err() != nil {
+						handoffCancellation()
+						return nil, fmt.Errorf("llm.request failed: %w", requestCtx.Err())
+					}
 					if result.err != nil {
 						if ctx.Err() != nil || requestCtx.Err() != nil {
-							publishCancel()
+							handoffCancellation()
 						}
 						return nil, fmt.Errorf("llm.request failed: %w", result.err)
 					}
@@ -205,7 +234,7 @@ func (c *Client) RequestLLMWithProgress(ctx context.Context, req *models.LLMRequ
 				}
 			}
 		case <-requestCtx.Done():
-			publishCancel()
+			handoffCancellation()
 			return nil, fmt.Errorf("llm.request failed: %w", requestCtx.Err())
 		}
 	}
