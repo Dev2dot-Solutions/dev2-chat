@@ -18,7 +18,9 @@ const (
 	SubjectChatSessionCreated = "chat.session.created"
 	SubjectChatMessageSent    = "chat.message.sent"
 	SubjectCompanyProjectsGet = "company.projects.get"
+	SubjectToolApprove        = "tool.approve"
 	companyProjectsCacheTTL   = 60 * time.Second
+	toolApproveTimeout        = 10 * time.Second
 )
 
 // Client manages NATS connections for dev2-chat.
@@ -161,6 +163,22 @@ func (c *Client) RequestCompanyProjects(companyID string) ([]models.CompanyProje
 	}
 	c.projectsMu.Unlock()
 	return resp.Projects, nil
+}
+
+// RequestToolApproval forwards an approval decision to dev2-llm-service via
+// tool.approve request-reply (DEV2-108). Session and user identity must
+// already be resolved from the authenticated session — never from the HTTP
+// request body.
+func (c *Client) RequestToolApproval(req *models.ToolApprovalRequest) (*models.ToolApprovalResponse, error) {
+	if c.enc == nil {
+		return nil, fmt.Errorf("NATS not connected")
+	}
+	var resp models.ToolApprovalResponse
+	err := c.enc.Request(SubjectToolApprove, req, &resp, toolApproveTimeout)
+	if err != nil {
+		return nil, fmt.Errorf("tool.approve request failed: %w", err)
+	}
+	return &resp, nil
 }
 
 // PublishSessionCreated publishes a chat.session.created event.

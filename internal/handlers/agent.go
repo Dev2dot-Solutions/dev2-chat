@@ -6,6 +6,7 @@ import (
 	"log"
 	"net/http"
 	"strings"
+	"time"
 
 	"github.com/Dev2dot-Solutions/dev2-chat/internal/llm"
 	"github.com/Dev2dot-Solutions/dev2-chat/internal/models"
@@ -18,6 +19,7 @@ import (
 type AgentHandler struct {
 	sessionRepo   *repository.SessionRepo
 	messageRepo   *repository.MessageRepo
+	approvalRepo  *repository.ApprovalRepo
 	knowledgeRepo *repository.KnowledgeRepo
 	llmClient     *llm.Client
 	natsClient    *nats.Client
@@ -29,6 +31,7 @@ type AgentHandler struct {
 func NewAgentHandler(
 	sr *repository.SessionRepo,
 	mr *repository.MessageRepo,
+	ar *repository.ApprovalRepo,
 	kr *repository.KnowledgeRepo,
 	lc *llm.Client,
 	nc *nats.Client,
@@ -38,6 +41,7 @@ func NewAgentHandler(
 	return &AgentHandler{
 		sessionRepo:   sr,
 		messageRepo:   mr,
+		approvalRepo:  ar,
 		knowledgeRepo: kr,
 		llmClient:     lc,
 		natsClient:    nc,
@@ -81,9 +85,19 @@ func (h *AgentHandler) Ask(w http.ResponseWriter, r *http.Request) {
 	h.saveMessage(r, session.ID, "user", req.Question, "", "")
 
 	llmReq := h.buildLLMRequest(systemPrompt, history, req, profile, project)
-	finalAnswer, toolCallResults := h.processLLMResponse(r, session, llmReq, req, profile, project)
+	finalAnswer, toolCallResults, pendingApprovals := h.processLLMResponse(r, session, llmReq, req, profile, project)
 
-	h.saveMessage(r, session.ID, "assistant", finalAnswer, "", "")
+	h.recordPendingApprovals(r, session, pendingApprovals)
+
+	assistantMsg := &models.ChatMessage{
+		SessionID:        session.ID,
+		Role:             "assistant",
+		Content:          finalAnswer,
+		PendingApprovals: pendingApprovals,
+	}
+	if err := h.messageRepo.Create(r.Context(), assistantMsg); err != nil {
+		log.Printf("[agent] Save message error: %v", err)
+	}
 
 	if llmResp, _ := h.callLLM(llmReq); llmResp != nil && llmResp.Usage != nil {
 		h.sessionRepo.UpdateTokenCount(r.Context(), session.ID, llmResp.Usage.TotalTokens)
@@ -98,15 +112,16 @@ func (h *AgentHandler) Ask(w http.ResponseWriter, r *http.Request) {
 	}
 
 	if req.Stream || r.URL.Query().Get("stream") == "true" {
-		h.streamAnswer(w, session, finalAnswer, toolCallResults, sources)
+		h.streamAnswer(w, session, finalAnswer, toolCallResults, pendingApprovals, sources)
 		return
 	}
 
 	respondJSON(w, http.StatusOK, models.ChatResponse{
-		Answer:         finalAnswer,
-		ConversationID: session.ID,
-		ToolCalls:      toolCallResults,
-		Sources:        sources,
+		Answer:           finalAnswer,
+		ConversationID:   session.ID,
+		ToolCalls:        toolCallResults,
+		PendingApprovals: pendingApprovals,
+		Sources:          sources,
 	})
 }
 
@@ -284,15 +299,19 @@ func (h *AgentHandler) buildLLMRequest(systemPrompt string, history []models.Cha
 	return llmReq
 }
 
-func (h *AgentHandler) processLLMResponse(r *http.Request, session *models.ChatSession, llmReq *models.LLMRequest, req models.ChatRequest, profile string, project *models.CompanyProject) (string, []models.ToolCallDisplay) {
+func (h *AgentHandler) processLLMResponse(r *http.Request, session *models.ChatSession, llmReq *models.LLMRequest, req models.ChatRequest, profile string, project *models.CompanyProject) (string, []models.ToolCallDisplay, []models.PendingApproval) {
 	llmResp, err := h.callLLM(llmReq)
 	if err != nil {
 		log.Printf("[agent] LLM call failed: %v", err)
-		return "AI service unavailable. Please try again.", nil
+		return "AI service unavailable. Please try again.", nil, nil
 	}
 
 	finalAnswer := llmResp.Content
 	var toolCallResults []models.ToolCallDisplay
+
+	// Approval-gated tools executed inside dev2-llm-service report back as
+	// tool results with a pending_approval payload (DEV2-108).
+	pendingApprovals := parsePendingApprovals(llmResp.ToolResults)
 
 	if len(llmResp.ToolCalls) > 0 {
 		assistantMsg := &models.ChatMessage{
@@ -326,16 +345,87 @@ func (h *AgentHandler) processLLMResponse(r *http.Request, session *models.ChatS
 		if err == nil && followUpResp.Content != "" {
 			finalAnswer = followUpResp.Content
 		}
+		if err == nil {
+			pendingApprovals = append(pendingApprovals, parsePendingApprovals(followUpResp.ToolResults)...)
+		}
 	}
 
-	return finalAnswer, toolCallResults
+	return finalAnswer, toolCallResults, pendingApprovals
+}
+
+// parsePendingApprovals extracts approval requests from dev2-llm-service
+// tool results. Approval-gated tools return an Output payload shaped
+// {"status":"pending_approval","approvalId":...,"summary":...,"preview":...,
+// "expiresAt":...} (camelCase); anything else is ignored.
+func parsePendingApprovals(results []models.LLMToolResult) []models.PendingApproval {
+	var out []models.PendingApproval
+	for _, tr := range results {
+		if tr.Output == "" {
+			continue
+		}
+		var payload map[string]any
+		if err := json.Unmarshal([]byte(tr.Output), &payload); err != nil {
+			continue
+		}
+		if status, _ := payload["status"].(string); status != "pending_approval" {
+			continue
+		}
+		approvalID, _ := payload["approvalId"].(string)
+		if approvalID == "" {
+			continue
+		}
+		pa := models.PendingApproval{
+			ApprovalID: approvalID,
+			Tool:       tr.ToolName,
+			Status:     models.ApprovalStatusPending,
+		}
+		if t, _ := payload["tool"].(string); t != "" {
+			pa.Tool = t
+		}
+		pa.Summary, _ = payload["summary"].(string)
+		pa.Preview, _ = payload["preview"].(string)
+		if pa.Summary == "" {
+			pa.Summary = pa.Preview
+		}
+		if e, _ := payload["expiresAt"].(string); e != "" {
+			if ts, err := time.Parse(time.RFC3339, e); err == nil {
+				pa.ExpiresAt = ts
+			}
+		}
+		out = append(out, pa)
+	}
+	return out
+}
+
+// recordPendingApprovals persists the approvalId → session mapping used by
+// the decision endpoint to resolve ownership (DEV2-108). Best-effort: a
+// persistence failure is logged but does not fail the chat response.
+func (h *AgentHandler) recordPendingApprovals(r *http.Request, session *models.ChatSession, approvals []models.PendingApproval) {
+	if h.approvalRepo == nil {
+		return
+	}
+	for _, pa := range approvals {
+		rec := &models.ApprovalRecord{
+			ID:        pa.ApprovalID,
+			SessionID: session.ID,
+			CompanyID: session.CompanyID,
+			UserID:    session.UserID,
+			Tool:      pa.Tool,
+			Summary:   pa.Summary,
+			Preview:   pa.Preview,
+			ExpiresAt: pa.ExpiresAt,
+		}
+		if err := h.approvalRepo.RecordPending(r.Context(), rec); err != nil {
+			log.Printf("[agent] Record approval %s error: %v", pa.ApprovalID, err)
+		}
+	}
 }
 
 // streamAnswer writes the completed answer as Server-Sent Events. The NATS
 // llm.request exchange is single-shot request-reply, so the final content is
 // chunked here rather than token-streamed from the LLM — token-level
 // streaming and tool-call trace visibility are DEV2-100 follow-ups.
-func (h *AgentHandler) streamAnswer(w http.ResponseWriter, session *models.ChatSession, answer string, toolCalls []models.ToolCallDisplay, sources []models.Source) {
+func (h *AgentHandler) streamAnswer(w http.ResponseWriter, session *models.ChatSession, answer string, toolCalls []models.ToolCallDisplay, pendingApprovals []models.PendingApproval, sources []models.Source) {
 	flusher, ok := w.(http.Flusher)
 	if !ok {
 		respondError(w, http.StatusInternalServerError, "streaming not supported")
@@ -353,9 +443,10 @@ func (h *AgentHandler) streamAnswer(w http.ResponseWriter, session *models.ChatS
 	}
 
 	meta, _ := json.Marshal(models.ChatResponse{
-		ConversationID: session.ID,
-		ToolCalls:      toolCalls,
-		Sources:        sources,
+		ConversationID:   session.ID,
+		ToolCalls:        toolCalls,
+		PendingApprovals: pendingApprovals,
+		Sources:          sources,
 	})
 	fmt.Fprintf(w, "event: meta\ndata: %s\n\n", meta)
 	fmt.Fprintf(w, "event: done\ndata: [DONE]\n\n")

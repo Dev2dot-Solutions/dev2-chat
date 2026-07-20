@@ -73,3 +73,16 @@ func (r *MessageRepo) GetLastBySession(ctx context.Context, sessionID string) (*
 	}
 	return &msg, nil
 }
+
+// UpdateApprovalStatus sets the status of one embedded pending approval on
+// whichever message in the session carries it, so a reloaded session shows
+// the card as decided (DEV2-108).
+func (r *MessageRepo) UpdateApprovalStatus(ctx context.Context, sessionID, approvalID, status string) error {
+	_, err := r.coll.UpdateOne(ctx,
+		bson.M{"sessionId": sessionID, "pendingApprovals.approvalId": approvalID},
+		bson.M{"$set": bson.M{"pendingApprovals.$.status": status}})
+	if err != nil {
+		return fmt.Errorf("update approval status: %w", err)
+	}
+	return nil
+}

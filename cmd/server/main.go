@@ -74,6 +74,7 @@ func main() {
 	// Repositories
 	sessionRepo := repository.NewSessionRepo(mongoDB)
 	messageRepo := repository.NewMessageRepo(mongoDB)
+	approvalRepo := repository.NewApprovalRepo(mongoDB)
 	knowledgeRepo := repository.NewKnowledgeRepo(mongoDB)
 	settingsRepo := repository.NewSettingsRepo(mongoDB)
 
@@ -107,9 +108,9 @@ func main() {
 	)
 
 	// Handlers
-	chatHandler := handlers.NewChatHandler(sessionRepo, messageRepo)
+	chatHandler := handlers.NewChatHandler(sessionRepo, messageRepo, approvalRepo, natsClient)
 	agentHandler := handlers.NewAgentHandler(
-		sessionRepo, messageRepo, knowledgeRepo,
+		sessionRepo, messageRepo, approvalRepo, knowledgeRepo,
 		llmClient, natsClient, toolExecutor,
 		cfg.LLMModel, cfg.LLMProvider,
 	)

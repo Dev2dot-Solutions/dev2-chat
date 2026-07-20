@@ -30,8 +30,25 @@ type ChatMessage struct {
 	ToolCalls  []ToolCallResult `bson:"toolCalls,omitempty" json:"toolCalls,omitempty"`
 	ToolCallID string           `bson:"toolCallId,omitempty" json:"toolCallId,omitempty"`
 	Name       string           `bson:"name,omitempty" json:"name,omitempty"`
-	TokenCount int              `bson:"tokenCount,omitempty" json:"tokenCount,omitempty"`
-	CreatedAt  time.Time        `bson:"createdAt" json:"createdAt"`
+	// PendingApprovals carries the approval cards surfaced with this message
+	// (DEV2-108) so session reloads re-render them.
+	PendingApprovals []PendingApproval `bson:"pendingApprovals,omitempty" json:"pendingApprovals,omitempty"`
+	TokenCount       int               `bson:"tokenCount,omitempty" json:"tokenCount,omitempty"`
+	CreatedAt        time.Time         `bson:"createdAt" json:"createdAt"`
+}
+
+// PendingApproval describes a write/execute tool call awaiting a user
+// decision, surfaced from dev2-llm-service tool results whose payload has
+// status "pending_approval". Status starts as "pending" and is updated to
+// the decision outcome ("executed", "rejected", "expired") once decided via
+// POST /chat/approvals/{approvalId}.
+type PendingApproval struct {
+	ApprovalID string    `bson:"approvalId" json:"approvalId"`
+	Tool       string    `bson:"tool" json:"tool"`
+	Summary    string    `bson:"summary,omitempty" json:"summary,omitempty"`
+	Preview    string    `bson:"preview,omitempty" json:"preview,omitempty"`
+	ExpiresAt  time.Time `bson:"expiresAt,omitempty" json:"expiresAt,omitempty"`
+	Status     string    `bson:"status,omitempty" json:"status,omitempty"`
 }
 
 // ToolCallResult captures a tool invocation for persistence.
@@ -70,10 +87,11 @@ type ChatRequest struct {
 
 // ChatResponse is the response from the chat endpoint.
 type ChatResponse struct {
-	Answer         string            `json:"answer"`
-	ConversationID string            `json:"conversationId"`
-	ToolCalls      []ToolCallDisplay `json:"toolCalls,omitempty"`
-	Sources        []Source          `json:"sources,omitempty"`
+	Answer           string            `json:"answer"`
+	ConversationID   string            `json:"conversationId"`
+	ToolCalls        []ToolCallDisplay `json:"toolCalls,omitempty"`
+	PendingApprovals []PendingApproval `json:"pendingApprovals,omitempty"`
+	Sources          []Source          `json:"sources,omitempty"`
 }
 
 // ToolCallDisplay represents a tool call shown in the response.

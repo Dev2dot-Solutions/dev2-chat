@@ -91,7 +91,22 @@ type ToolFunction struct {
 type LLMResponse struct {
 	Content   string        `json:"content"`
 	ToolCalls []LLMToolCall `json:"tool_calls,omitempty"`
-	Usage     *Usage        `json:"usage,omitempty"`
+	// ToolResults are the tool executions dev2-llm-service performed during
+	// its internal tool loop (NATS llm.request flow). Write/execute tools
+	// surface approval requests here as Output payloads with status
+	// "pending_approval" (DEV2-108).
+	ToolResults []LLMToolResult `json:"toolResults,omitempty"`
+	Usage       *Usage          `json:"usage,omitempty"`
+}
+
+// LLMToolResult is one tool execution reported by dev2-llm-service. Output
+// is a stringified JSON payload; for approval-gated tools it decodes to
+// {"status":"pending_approval","approvalId":...,"preview":...}.
+type LLMToolResult struct {
+	ToolCallID string `json:"tool_call_id"`
+	ToolName   string `json:"toolName"`
+	Success    bool   `json:"success"`
+	Output     string `json:"output"`
 }
 
 // Usage tracks token usage.
