@@ -75,6 +75,10 @@ func main() {
 	sessionRepo := repository.NewSessionRepo(mongoDB)
 	messageRepo := repository.NewMessageRepo(mongoDB)
 	approvalRepo := repository.NewApprovalRepo(mongoDB)
+	socketRepo := repository.NewSocketRepo(mongoDB)
+	if err := socketRepo.EnsureIndexes(ctx); err != nil {
+		log.Fatalf("Failed to create socket indexes: %v", err)
+	}
 	knowledgeRepo := repository.NewKnowledgeRepo(mongoDB)
 	settingsRepo := repository.NewSettingsRepo(mongoDB)
 
@@ -116,16 +120,32 @@ func main() {
 		cfg.LLMModel, cfg.LLMProvider,
 	)
 	settingsHandler := handlers.NewSettingsHandler(settingsRepo)
+	socketHandler := handlers.NewSocketHandler(socketRepo, agentHandler, chatHandler, handlers.SocketOptions{
+		AllowedOrigins: cfg.SocketAllowedOrigins,
+		SendQueue:      cfg.SocketSendQueue,
+		ReadLimit:      cfg.SocketReadLimit,
+		PingInterval:   cfg.SocketPingInterval,
+		IdleTimeout:    cfg.SocketIdleTimeout,
+	})
 
 	// Router
 	r := chi.NewRouter()
 	r.Use(chimw.RequestID)
 	r.Use(chimw.RealIP)
+	r.Use(handlers.SocketTicketRedactionMiddleware)
 	r.Use(chimw.Logger)
 	r.Use(chimw.Recoverer)
-	r.Use(chimw.Timeout(30 * time.Second))
+	r.Use(func(next http.Handler) http.Handler {
+		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			if r.URL.Path == "/chat/ws" {
+				next.ServeHTTP(w, r)
+				return
+			}
+			chimw.Timeout(30*time.Second)(next).ServeHTTP(w, r)
+		})
+	})
 	r.Use(cors.Handler(cors.Options{
-		AllowedOrigins:   []string{"*"},
+		AllowedOrigins:   cfg.SocketAllowedOrigins,
 		AllowedMethods:   []string{"GET", "POST", "PATCH", "DELETE", "OPTIONS"},
 		AllowedHeaders:   []string{"Accept", "Authorization", "Content-Type"},
 		ExposedHeaders:   []string{"Link"},
@@ -145,6 +165,7 @@ func main() {
 	chatHandler.Routes(r)
 	agentHandler.Routes(r)
 	settingsHandler.Routes(r)
+	socketHandler.Routes(r)
 
 	// Server
 	addr := fmt.Sprintf(":%d", cfg.Port)

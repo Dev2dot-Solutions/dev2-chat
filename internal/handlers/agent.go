@@ -34,6 +34,22 @@ type agentResult struct {
 	toolCalls        []models.ToolCallDisplay
 	pendingApprovals []models.PendingApproval
 	totalTokens      int
+	cancelled        bool
+}
+
+type preparedAgentRequest struct {
+	session     *models.ChatSession
+	project     *models.CompanyProject
+	req         models.ChatRequest
+	profile     string
+	actorUserID string
+	llmReq      *models.LLMRequest
+	sources     []models.Source
+}
+
+type completedAgentRequest struct {
+	result    agentResult
+	toolTrace []models.ToolTraceEvent
 }
 
 func NewAgentHandler(
@@ -78,18 +94,46 @@ func (h *AgentHandler) Ask(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	session, project, status, errMsg := h.resolveSession(r, req)
+	prepared, status, errMsg := h.prepareAgentRequest(r, req)
 	if errMsg != "" {
 		respondError(w, status, errMsg)
 		return
+	}
+
+	if req.Stream || r.URL.Query().Get("stream") == "true" {
+		h.streamAnswer(w, r, prepared)
+		return
+	}
+
+	completed := h.completeAgentRequest(r, prepared, nil)
+	if completed.result.cancelled {
+		respondError(w, http.StatusRequestTimeout, "generation cancelled")
+		return
+	}
+
+	respondJSON(w, http.StatusOK, models.ChatResponse{
+		Answer:           completed.result.answer,
+		ConversationID:   prepared.session.ID,
+		ToolCalls:        completed.result.toolCalls,
+		ToolTrace:        completed.toolTrace,
+		PendingApprovals: completed.result.pendingApprovals,
+		Sources:          prepared.sources,
+	})
+}
+
+// prepareAgentRequest is shared by REST/SSE and WebSocket transports. It owns
+// all session creation, identity binding, project visibility, history and
+// prompt preparation so transport handlers cannot fork chat business logic.
+func (h *AgentHandler) prepareAgentRequest(r *http.Request, req models.ChatRequest) (*preparedAgentRequest, int, string) {
+	session, project, status, errMsg := h.resolveSession(r, req)
+	if errMsg != "" {
+		return nil, status, errMsg
 	}
 	profile := models.NormalizeAccessProfile(session.AccessProfile)
 	actorUserID := GetUserID(r)
 	if actorUserID == "" {
 		actorUserID = session.UserID
 	}
-	// From this point onward all identity/scoping comes from authenticated or
-	// persisted session state, never from the request body.
 	req.CompanyID = session.CompanyID
 	req.UserID = actorUserID
 	req.ConversationID = session.ID
@@ -100,40 +144,37 @@ func (h *AgentHandler) Ask(w http.ResponseWriter, r *http.Request) {
 	systemPrompt := "You are a helpful AI assistant for the Dev2Knowledge platform. " +
 		"Answer questions based on the knowledge context provided. " +
 		"When you need more information, use the available tools to search knowledge, " +
-		"look up tickets, or interact with the Project Tracker." +
-		knowledgeContext
-
+		"look up tickets, or interact with the Project Tracker." + knowledgeContext
 	history, _ := h.messageRepo.ListBySession(r.Context(), session.ID, 10)
-
 	h.saveMessage(r, session.ID, "user", req.Question, "", "")
 
-	llmReq := h.buildLLMRequest(systemPrompt, history, req, profile, project)
-
-	var sources []models.Source
+	prepared := &preparedAgentRequest{
+		session: session, project: project, req: req, profile: profile,
+		actorUserID: actorUserID,
+		llmReq:      h.buildLLMRequest(systemPrompt, history, req, profile, project),
+	}
 	if knowledgeContext != "" {
-		sources = []models.Source{{Type: "knowledge_graph", Label: "Context from knowledge graph"}}
+		prepared.sources = []models.Source{{Type: "knowledge_graph", Label: "Context from knowledge graph"}}
 	}
+	return prepared, 0, ""
+}
 
-	if req.Stream || r.URL.Query().Get("stream") == "true" {
-		h.streamAnswer(w, r, session, llmReq, req, profile, project, actorUserID, sources)
-		return
-	}
-
+func (h *AgentHandler) completeAgentRequest(r *http.Request, prepared *preparedAgentRequest, onProgress func(models.ToolTraceEvent)) completedAgentRequest {
 	var progress []models.ToolTraceEvent
-	result := h.processLLMResponse(r, session, llmReq, req, profile, project, func(event models.ToolTraceEvent) {
+	result := h.processLLMResponse(r, prepared.session, prepared.llmReq, prepared.req, prepared.profile, prepared.project, func(event models.ToolTraceEvent) {
+		if !models.IsToolTraceEvent(event) {
+			return
+		}
 		progress = append(progress, event)
+		if onProgress != nil {
+			onProgress(event)
+		}
 	})
 	toolTrace := models.NormalizeToolTrace(progress)
-	h.finishAsk(r, session, req, actorUserID, result, toolTrace)
-
-	respondJSON(w, http.StatusOK, models.ChatResponse{
-		Answer:           result.answer,
-		ConversationID:   session.ID,
-		ToolCalls:        result.toolCalls,
-		ToolTrace:        toolTrace,
-		PendingApprovals: result.pendingApprovals,
-		Sources:          sources,
-	})
+	if !result.cancelled {
+		h.finishAsk(r, prepared.session, prepared.req, prepared.actorUserID, result, toolTrace)
+	}
+	return completedAgentRequest{result: result, toolTrace: toolTrace}
 }
 
 // resolveSession loads or creates the chat session for a request and enforces
@@ -189,31 +230,9 @@ func (h *AgentHandler) resolveSession(r *http.Request, req models.ChatRequest) (
 		}
 		profile = req.AccessProfile
 	}
-	if profile == models.AccessProfileDeveloper && !isAdmin {
-		return nil, nil, http.StatusForbidden, "developer profile requires an admin user"
-	}
-
-	var project *models.CompanyProject
-	if req.ProjectID != "" {
-		p, err := h.lookupProject(r, req.CompanyID, req.ProjectID)
-		if err != nil {
-			log.Printf("[agent] project lookup error: %v", err)
-			return nil, nil, http.StatusBadGateway, "failed to resolve project"
-		}
-		if p == nil {
-			return nil, nil, http.StatusBadRequest, "unknown projectId for this company"
-		}
-		switch profile {
-		case models.AccessProfileClient:
-			if !p.Visibility.Client {
-				return nil, nil, http.StatusForbidden, "project is not visible to client chat"
-			}
-		case models.AccessProfileDeveloper:
-			if !p.Visibility.Developer {
-				return nil, nil, http.StatusForbidden, "project is not visible to developer chat"
-			}
-		}
-		project = p
+	project, status, errMsg := h.validateNewSessionScope(r, req.CompanyID, profile, req.ProjectID)
+	if errMsg != "" {
+		return nil, nil, status, errMsg
 	}
 
 	userID := req.UserID
@@ -242,6 +261,35 @@ func (h *AgentHandler) resolveSession(r *http.Request, req models.ChatRequest) (
 	}
 	go h.natsClient.PublishSessionCreated(s)
 	return s, project, 0, ""
+}
+
+// validateNewSessionScope is used both when creating a session and when
+// issuing a socket ticket, keeping profile/admin/project policy identical.
+func (h *AgentHandler) validateNewSessionScope(r *http.Request, companyID, profile, projectID string) (*models.CompanyProject, int, string) {
+	if !models.IsValidAccessProfile(profile) {
+		return nil, http.StatusBadRequest, "accessProfile must be \"client\" or \"developer\""
+	}
+	if profile == models.AccessProfileDeveloper && !GetIsAdmin(r) {
+		return nil, http.StatusForbidden, "developer profile requires an admin user"
+	}
+	if projectID == "" {
+		return nil, 0, ""
+	}
+	p, err := h.lookupProject(r, companyID, projectID)
+	if err != nil {
+		log.Printf("[agent] project lookup error: %v", err)
+		return nil, http.StatusBadGateway, "failed to resolve project"
+	}
+	if p == nil {
+		return nil, http.StatusBadRequest, "unknown projectId for this company"
+	}
+	if profile == models.AccessProfileClient && !p.Visibility.Client {
+		return nil, http.StatusForbidden, "project is not visible to client chat"
+	}
+	if profile == models.AccessProfileDeveloper && !p.Visibility.Developer {
+		return nil, http.StatusForbidden, "project is not visible to developer chat"
+	}
+	return p, 0, ""
 }
 
 // lookupProject resolves a Dev2Project via company.projects.get (cached).
@@ -315,6 +363,9 @@ func (h *AgentHandler) buildLLMRequest(systemPrompt string, history []models.Cha
 func (h *AgentHandler) processLLMResponse(r *http.Request, session *models.ChatSession, llmReq *models.LLMRequest, req models.ChatRequest, profile string, project *models.CompanyProject, onProgress func(models.ToolTraceEvent)) agentResult {
 	llmResp, err := h.callLLM(r.Context(), llmReq, onProgress)
 	if err != nil {
+		if r.Context().Err() != nil {
+			return agentResult{cancelled: true}
+		}
 		log.Printf("[agent] LLM call failed: %v", err)
 		return agentResult{answer: "AI service unavailable. Please try again."}
 	}
@@ -447,7 +498,7 @@ func (h *AgentHandler) recordPendingApprovals(r *http.Request, session *models.C
 // streamAnswer owns all ResponseWriter access. The worker reports progress and
 // its final result over channels so NATS callbacks can never write SSE data
 // concurrently.
-func (h *AgentHandler) streamAnswer(w http.ResponseWriter, r *http.Request, session *models.ChatSession, llmReq *models.LLMRequest, req models.ChatRequest, profile string, project *models.CompanyProject, actorUserID string, sources []models.Source) {
+func (h *AgentHandler) streamAnswer(w http.ResponseWriter, r *http.Request, prepared *preparedAgentRequest) {
 	if r.Context().Err() != nil {
 		return
 	}
@@ -466,7 +517,7 @@ func (h *AgentHandler) streamAnswer(w http.ResponseWriter, r *http.Request, sess
 	progressCh := make(chan models.ToolTraceEvent, 64)
 	resultCh := make(chan agentResult, 1)
 	go func() {
-		result := h.processLLMResponse(r, session, llmReq, req, profile, project, func(event models.ToolTraceEvent) {
+		completed := h.completeAgentRequest(r, prepared, func(event models.ToolTraceEvent) {
 			if !models.IsToolTraceEvent(event) {
 				return
 			}
@@ -479,7 +530,7 @@ func (h *AgentHandler) streamAnswer(w http.ResponseWriter, r *http.Request, sess
 			}
 		})
 		select {
-		case resultCh <- result:
+		case resultCh <- completed.result:
 		case <-r.Context().Done():
 		}
 	}()
@@ -517,8 +568,10 @@ func (h *AgentHandler) streamAnswer(w http.ResponseWriter, r *http.Request, sess
 				}
 			}
 
+			if result.cancelled {
+				return
+			}
 			toolTrace := models.NormalizeToolTrace(progress)
-			h.finishAsk(r, session, req, actorUserID, result, toolTrace)
 			for _, chunk := range chunkText(result.answer, 200) {
 				if r.Context().Err() != nil {
 					return
@@ -530,7 +583,7 @@ func (h *AgentHandler) streamAnswer(w http.ResponseWriter, r *http.Request, sess
 			if r.Context().Err() != nil {
 				return
 			}
-			if err := writeSSEJSON(w, flusher, "meta", buildStreamMeta(session.ID, result, toolTrace, sources)); err != nil {
+			if err := writeSSEJSON(w, flusher, "meta", buildStreamMeta(prepared.session.ID, result, toolTrace, prepared.sources)); err != nil {
 				return
 			}
 			if r.Context().Err() != nil {

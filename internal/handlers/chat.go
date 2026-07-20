@@ -160,43 +160,49 @@ func (h *ChatHandler) DecideApproval(w http.ResponseWriter, r *http.Request) {
 		respondError(w, http.StatusBadRequest, "decision must be \"approve\" or \"reject\"")
 		return
 	}
+	status, payload, errMsg := h.decideApproval(r, approvalID, req.Decision)
+	if errMsg != "" {
+		respondError(w, status, errMsg)
+		return
+	}
+	respondJSON(w, status, payload)
+}
 
+// decideApproval contains the authorization and business transaction shared
+// by REST and WebSocket approval decisions.
+func (h *ChatHandler) decideApproval(r *http.Request, approvalID, decision string) (int, map[string]any, string) {
 	rec, err := h.approvalRepo.GetByID(r.Context(), approvalID)
 	if err != nil {
 		log.Printf("[chat] DecideApproval lookup error: %v", err)
-		respondError(w, http.StatusInternalServerError, "failed to load approval")
-		return
+		return http.StatusInternalServerError, nil, "failed to load approval"
 	}
 	if rec == nil {
-		respondError(w, http.StatusNotFound, "approval not found")
-		return
+		return http.StatusNotFound, nil, "approval not found"
 	}
 
 	session, err := h.sessionRepo.GetByID(r.Context(), rec.SessionID)
 	if err != nil {
 		log.Printf("[chat] DecideApproval session error: %v", err)
-		respondError(w, http.StatusInternalServerError, "failed to load session")
-		return
+		return http.StatusInternalServerError, nil, "failed to load session"
 	}
 	if session == nil {
-		respondError(w, http.StatusNotFound, "approval not found")
-		return
+		return http.StatusNotFound, nil, "approval not found"
 	}
 
 	if !GetIsAdmin(r) {
 		if models.NormalizeAccessProfile(session.AccessProfile) == models.AccessProfileDeveloper {
-			respondError(w, http.StatusForbidden, "developer sessions require an admin user")
-			return
+			return http.StatusForbidden, nil, "developer sessions require an admin user"
 		}
 		if uid := GetUserID(r); uid == "" || session.UserID == "" || session.UserID != uid {
-			respondError(w, http.StatusForbidden, "session belongs to a different user")
-			return
+			return http.StatusForbidden, nil, "session belongs to a different user"
 		}
+	}
+	if companyID := GetCompanyID(r); companyID != "" && session.CompanyID != companyID {
+		return http.StatusForbidden, nil, "session belongs to a different company"
 	}
 
 	if rec.Status != models.ApprovalStatusPending {
-		respondError(w, http.StatusConflict, "approval already decided")
-		return
+		return http.StatusConflict, nil, "approval already decided"
 	}
 
 	// Identity is taken from the persisted approval/session, not the request body.
@@ -206,54 +212,52 @@ func (h *ChatHandler) DecideApproval(w http.ResponseWriter, r *http.Request) {
 	}
 	toolResp, err := h.natsClient.RequestToolApproval(&models.ToolApprovalRequest{
 		ApprovalID: rec.ID,
-		Decision:   req.Decision,
+		Decision:   decision,
 		SessionID:  session.ID,
 		UserID:     approvalUserID,
 	})
 	if err != nil {
 		log.Printf("[chat] tool.approve failed for %s: %v", approvalID, err)
-		respondError(w, http.StatusBadGateway, "approval service unavailable")
-		return
+		return http.StatusBadGateway, nil, "approval service unavailable"
 	}
 
 	switch toolResp.Status {
 	case models.ApprovalStatusExecuted, models.ApprovalStatusRejected:
-		if ok, err := h.approvalRepo.MarkDecided(r.Context(), rec.ID, req.Decision, toolResp.Status); err != nil {
+		if ok, err := h.approvalRepo.MarkDecided(r.Context(), rec.ID, decision, toolResp.Status); err != nil {
 			log.Printf("[chat] MarkDecided error for %s: %v", approvalID, err)
 		} else if !ok {
 			// Lost a race with a concurrent decision.
-			respondError(w, http.StatusConflict, "approval already decided")
-			return
+			return http.StatusConflict, nil, "approval already decided"
 		}
 		if err := h.messageRepo.UpdateApprovalStatus(r.Context(), session.ID, rec.ID, toolResp.Status); err != nil {
 			log.Printf("[chat] UpdateApprovalStatus error for %s: %v", approvalID, err)
 		}
-		h.appendDecisionMessage(r, session, rec, req.Decision, toolResp.Status)
-		respondJSON(w, http.StatusOK, map[string]any{
+		h.appendDecisionMessage(r, session, rec, decision, toolResp.Status)
+		return http.StatusOK, map[string]any{
 			"approvalId": rec.ID,
-			"decision":   req.Decision,
+			"decision":   decision,
 			"status":     toolResp.Status,
 			"result":     toolResp.Result,
-		})
+		}, ""
 	case models.ApprovalStatusExpired:
 		// Terminal: the card is dead, block repeat actions.
-		if _, err := h.approvalRepo.MarkDecided(r.Context(), rec.ID, req.Decision, models.ApprovalStatusExpired); err != nil {
+		if _, err := h.approvalRepo.MarkDecided(r.Context(), rec.ID, decision, models.ApprovalStatusExpired); err != nil {
 			log.Printf("[chat] MarkDecided error for %s: %v", approvalID, err)
 		}
 		if err := h.messageRepo.UpdateApprovalStatus(r.Context(), session.ID, rec.ID, models.ApprovalStatusExpired); err != nil {
 			log.Printf("[chat] UpdateApprovalStatus error for %s: %v", approvalID, err)
 		}
-		respondError(w, http.StatusConflict, "approval expired")
+		return http.StatusConflict, nil, "approval expired"
 	case "not_found":
-		if _, err := h.approvalRepo.MarkDecided(r.Context(), rec.ID, req.Decision, models.ApprovalStatusExpired); err != nil {
+		if _, err := h.approvalRepo.MarkDecided(r.Context(), rec.ID, decision, models.ApprovalStatusExpired); err != nil {
 			log.Printf("[chat] MarkDecided error for %s: %v", approvalID, err)
 		}
-		respondError(w, http.StatusNotFound, "approval not found or expired")
+		return http.StatusNotFound, nil, "approval not found or expired"
 	case "unauthorized":
-		respondError(w, http.StatusForbidden, "approval decision rejected by approval service")
+		return http.StatusForbidden, nil, "approval decision rejected by approval service"
 	default:
 		log.Printf("[chat] tool.approve unexpected status for %s: %q (error=%s)", approvalID, toolResp.Status, toolResp.Error)
-		respondError(w, http.StatusBadGateway, "approval decision failed")
+		return http.StatusBadGateway, nil, "approval decision failed"
 	}
 }
 

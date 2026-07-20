@@ -15,6 +15,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/Dev2dot-Solutions/dev2-chat/internal/models"
 	"github.com/golang-jwt/jwt/v5"
 )
 
@@ -22,11 +23,12 @@ import (
 type contextKey string
 
 const (
-	ContextUserID    contextKey = "userId"
-	ContextCompanyID contextKey = "companyId"
-	ContextIsAdmin   contextKey = "isAdmin"
-	ContextUserEmail contextKey = "userEmail"
-	ContextUserName  contextKey = "userName"
+	ContextUserID       contextKey = "userId"
+	ContextCompanyID    contextKey = "companyId"
+	ContextIsAdmin      contextKey = "isAdmin"
+	ContextUserEmail    contextKey = "userEmail"
+	ContextUserName     contextKey = "userName"
+	contextSocketTicket contextKey = "socketTicket"
 )
 
 // jwksCache holds the fetched JWKS keys with a TTL
@@ -146,8 +148,9 @@ func rsaPublicKeyFromJWK(key jwkKey) (*rsa.PublicKey, error) {
 // AuthMiddleware validates the Authorization Bearer token against Authentik JWKS.
 func AuthMiddleware(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		// Skip auth for health endpoint
-		if r.URL.Path == "/health" {
+		// A WebSocket upgrade authenticates with the one-time ticket consumed by
+		// its handler. Ticket issuance remains behind JWT middleware.
+		if r.URL.Path == "/health" || r.URL.Path == "/chat/ws" {
 			next.ServeHTTP(w, r)
 			return
 		}
@@ -267,6 +270,36 @@ func AuthMiddleware(next http.Handler) http.Handler {
 
 		next.ServeHTTP(w, r.WithContext(ctx))
 	})
+}
+
+// SocketTicketRedactionMiddleware removes the raw socket ticket from the URL
+// before request logging while retaining it only in request context.
+func SocketTicketRedactionMiddleware(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/chat/ws" {
+			ticket := r.URL.Query().Get("ticket")
+			clone := r.Clone(context.WithValue(r.Context(), contextSocketTicket, ticket))
+			urlCopy := *r.URL
+			urlCopy.RawQuery = ""
+			clone.URL = &urlCopy
+			clone.RequestURI = urlCopy.Path
+			r = clone
+		}
+		next.ServeHTTP(w, r)
+	})
+}
+
+func socketTicketFromRequest(r *http.Request) string {
+	ticket, _ := r.Context().Value(contextSocketTicket).(string)
+	return ticket
+}
+
+func requestWithSocketIdentity(ctx context.Context, identity models.SocketIdentity) *http.Request {
+	ctx = context.WithValue(ctx, ContextUserID, identity.UserID)
+	ctx = context.WithValue(ctx, ContextCompanyID, identity.CompanyID)
+	ctx = context.WithValue(ctx, ContextIsAdmin, identity.IsAdmin)
+	req, _ := http.NewRequestWithContext(ctx, http.MethodGet, "http://socket.internal/", nil)
+	return req
 }
 
 // GetUserID extracts the authenticated user ID from the request context.
