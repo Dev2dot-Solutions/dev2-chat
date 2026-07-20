@@ -37,27 +37,35 @@ type PtItem struct {
 
 // LLMRequest is sent to dev2-llm-service (or direct LLM API).
 type LLMRequest struct {
-	Model       string              `json:"model"`
-	Messages    []LLMMessage        `json:"messages"`
-	Tools       []ToolDefinition    `json:"tools,omitempty"`
-	MaxTokens   int                 `json:"max_tokens,omitempty"`
-	Temperature float64             `json:"temperature,omitempty"`
+	Model       string           `json:"model"`
+	Messages    []LLMMessage     `json:"messages"`
+	Tools       []ToolDefinition `json:"tools,omitempty"`
+	MaxTokens   int              `json:"max_tokens,omitempty"`
+	Temperature float64          `json:"temperature,omitempty"`
+	// AccessProfile is the session's access profile ("client"|"developer");
+	// dev2-llm-service filters its own tool advertisement/enforcement with it.
+	AccessProfile string `json:"accessProfile,omitempty"`
+	// Workspace scoping for project-bound sessions; dev2-llm-service uses
+	// these to activate its code-agent tool flow and persona resolution.
+	WorkspaceCompanyID    string `json:"workspaceCompanyId,omitempty"`
+	WorkspaceProjectID    string `json:"workspaceProjectId,omitempty"`
+	WorkspacePTProjectKey string `json:"workspacePtProjectKey,omitempty"`
 }
 
 // LLMMessage is a message in the LLM conversation.
 type LLMMessage struct {
-	Role      string        `json:"role"`
-	Content   string        `json:"content"`
-	ToolCalls []LLMToolCall `json:"tool_calls,omitempty"`
-	ToolCallID string       `json:"tool_call_id,omitempty"`
-	Name      string        `json:"name,omitempty"`
+	Role       string        `json:"role"`
+	Content    string        `json:"content"`
+	ToolCalls  []LLMToolCall `json:"tool_calls,omitempty"`
+	ToolCallID string        `json:"tool_call_id,omitempty"`
+	Name       string        `json:"name,omitempty"`
 }
 
 // LLMToolCall is a tool call from the LLM.
 type LLMToolCall struct {
-	ID       string         `json:"id"`
-	Type     string         `json:"type"`
-	Function LLMFunction    `json:"function"`
+	ID       string      `json:"id"`
+	Type     string      `json:"type"`
+	Function LLMFunction `json:"function"`
 }
 
 // LLMFunction is the function details in a tool call.
@@ -68,15 +76,15 @@ type LLMFunction struct {
 
 // ToolDefinition describes a tool the LLM can call.
 type ToolDefinition struct {
-	Type     string         `json:"type"`
-	Function ToolFunction   `json:"function"`
+	Type     string       `json:"type"`
+	Function ToolFunction `json:"function"`
 }
 
 // ToolFunction describes a function tool.
 type ToolFunction struct {
-	Name        string     `json:"name"`
-	Description string     `json:"description"`
-	Parameters  any        `json:"parameters"`
+	Name        string `json:"name"`
+	Description string `json:"description"`
+	Parameters  any    `json:"parameters"`
 }
 
 // LLMResponse is the response from the LLM.
@@ -112,9 +120,9 @@ type KnowledgeSearchResult struct {
 
 // KnowledgeSearchResponse wraps search results.
 type KnowledgeSearchResponse struct {
-	Query         string                  `json:"query"`
-	Results       map[string][]KnowledgeSearchResult `json:"results"`
-	TotalMatches  int                     `json:"totalMatches"`
+	Query        string                             `json:"query"`
+	Results      map[string][]KnowledgeSearchResult `json:"results"`
+	TotalMatches int                                `json:"totalMatches"`
 }
 
 // KnowledgeEntityRequest requests a single entity by type + ID.

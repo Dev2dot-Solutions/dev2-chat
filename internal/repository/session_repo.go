@@ -31,15 +31,17 @@ func (r *SessionRepo) Create(ctx context.Context, input models.ChatSessionInput)
 		provider = "openai"
 	}
 	session := &models.ChatSession{
-		ID:         uuid.New().String(),
-		CompanyID:  input.CompanyID,
-		UserID:     input.UserID,
-		Title:      input.Title,
-		Model:      model,
-		Provider:   provider,
-		Status:     "active",
-		CreatedAt:  now,
-		UpdatedAt:  now,
+		ID:            uuid.New().String(),
+		CompanyID:     input.CompanyID,
+		UserID:        input.UserID,
+		Title:         input.Title,
+		Model:         model,
+		Provider:      provider,
+		Status:        "active",
+		AccessProfile: input.AccessProfile,
+		ProjectID:     input.ProjectID,
+		CreatedAt:     now,
+		UpdatedAt:     now,
 	}
 	_, err := r.coll.InsertOne(ctx, session)
 	if err != nil {
@@ -60,10 +62,20 @@ func (r *SessionRepo) GetByID(ctx context.Context, id string) (*models.ChatSessi
 	return &session, nil
 }
 
-func (r *SessionRepo) ListByCompany(ctx context.Context, companyID, userID string, limit, offset int) (*models.SessionListResponse, error) {
+// ListByCompany lists sessions for a company. accessProfile, when non-empty,
+// filters to sessions of that exact profile; excludeDeveloper (used for
+// non-admin listing without an explicit profile filter) hides developer
+// sessions while keeping legacy (untagged) sessions visible.
+func (r *SessionRepo) ListByCompany(ctx context.Context, companyID, userID, accessProfile string, excludeDeveloper bool, limit, offset int) (*models.SessionListResponse, error) {
 	filter := bson.M{"companyId": companyID}
 	if userID != "" {
 		filter["userId"] = userID
+	}
+	switch {
+	case accessProfile != "":
+		filter["accessProfile"] = accessProfile
+	case excludeDeveloper:
+		filter["accessProfile"] = bson.M{"$ne": models.AccessProfileDeveloper}
 	}
 
 	total, err := r.coll.CountDocuments(ctx, filter)
@@ -93,11 +105,13 @@ func (r *SessionRepo) ListByCompany(ctx context.Context, companyID, userID strin
 	items := make([]models.SessionListItem, len(sessions))
 	for i, s := range sessions {
 		items[i] = models.SessionListItem{
-			ID:        s.ID,
-			Title:     s.Title,
-			Model:     s.Model,
-			CreatedAt: s.CreatedAt,
-			UpdatedAt: s.UpdatedAt,
+			ID:            s.ID,
+			Title:         s.Title,
+			Model:         s.Model,
+			AccessProfile: s.AccessProfile,
+			ProjectID:     s.ProjectID,
+			CreatedAt:     s.CreatedAt,
+			UpdatedAt:     s.UpdatedAt,
 		}
 	}
 

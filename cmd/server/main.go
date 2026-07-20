@@ -55,6 +55,8 @@ func main() {
 			"user_id":         "userId",
 			"session_id":      "sessionId",
 			"conversation_id": "conversationId",
+			"access_profile":  "accessProfile",
+			"project_id":      "projectId",
 			"token_count":     "tokenCount",
 			"message_count":   "messageCount",
 			"tool_calls":      "toolCalls",
