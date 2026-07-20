@@ -19,6 +19,7 @@ const (
 	SubjectChatMessageSent    = "chat.message.sent"
 	SubjectCompanyProjectsGet = "company.projects.get"
 	SubjectToolApprove        = "tool.approve"
+	SubjectToolAudit          = "audit.tool.invocation"
 	companyProjectsCacheTTL   = 60 * time.Second
 	toolApproveTimeout        = 10 * time.Second
 )
@@ -68,7 +69,10 @@ func (c *Client) RequestLLM(req *models.LLMRequest) (*models.LLMResponse, error)
 	if c.enc == nil {
 		return nil, fmt.Errorf("NATS not connected")
 	}
-	sessionID := fmt.Sprintf("chat-%d", time.Now().UnixNano())
+	sessionID := req.SessionID
+	if sessionID == "" {
+		sessionID = fmt.Sprintf("chat-%d", time.Now().UnixNano())
+	}
 
 	// Build a NATSRequest-compatible payload
 	// Extract system prompt from messages
@@ -96,22 +100,17 @@ func (c *Client) RequestLLM(req *models.LLMRequest) (*models.LLMResponse, error)
 
 	natsReq := map[string]interface{}{
 		"sessionId":           sessionID,
+		"userId":              req.UserID,
 		"systemPrompt":        systemPrompt,
 		"conversationHistory": history,
 		"latestMessage":       latestMessage,
 		"modelOverride":       req.Model,
+		"accessProfile":       req.AccessProfile,
+		"workspaceCompanyId":  req.WorkspaceCompanyID,
+		"workspaceProjectId":  req.WorkspaceProjectID,
 	}
 	// Forward the session's access profile and workspace scoping so
 	// dev2-llm-service can gate its own tools and resolve personas.
-	if req.AccessProfile != "" {
-		natsReq["accessProfile"] = req.AccessProfile
-	}
-	if req.WorkspaceCompanyID != "" {
-		natsReq["workspaceCompanyId"] = req.WorkspaceCompanyID
-	}
-	if req.WorkspaceProjectID != "" {
-		natsReq["workspaceProjectId"] = req.WorkspaceProjectID
-	}
 	if req.WorkspacePTProjectKey != "" {
 		natsReq["workspacePtProjectKey"] = req.WorkspacePTProjectKey
 	}
@@ -213,6 +212,23 @@ func (c *Client) PublishMessageSent(sessionID, companyID, userID, role, content 
 	}
 	if err := c.enc.Publish(SubjectChatMessageSent, event); err != nil {
 		log.Printf("[nats] Failed to publish message.sent: %v", err)
+	}
+}
+
+// PublishToolInvocation publishes a local-tool audit event. NATS Publish is
+// asynchronous; callers also invoke this method in a goroutine so auditing can
+// never delay or fail a chat tool execution.
+func (c *Client) PublishToolInvocation(event models.ToolAuditEvent) {
+	if c.nc == nil {
+		return
+	}
+	payload, err := json.Marshal(event)
+	if err != nil {
+		log.Printf("[nats] Failed to marshal tool audit event: %v", err)
+		return
+	}
+	if err := c.nc.Publish(SubjectToolAudit, payload); err != nil {
+		log.Printf("[nats] Failed to publish tool audit event: %v", err)
 	}
 }
 

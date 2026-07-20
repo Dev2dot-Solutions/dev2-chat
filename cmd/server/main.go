@@ -105,6 +105,7 @@ func main() {
 		ticketsClient,
 		ptClient,
 		settingsRepo.GetPTConfig,
+		natsClient,
 	)
 
 	// Handlers

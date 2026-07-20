@@ -42,6 +42,10 @@ type LLMRequest struct {
 	Tools       []ToolDefinition `json:"tools,omitempty"`
 	MaxTokens   int              `json:"max_tokens,omitempty"`
 	Temperature float64          `json:"temperature,omitempty"`
+	// SessionID and UserID identify the authenticated chat actor and
+	// conversation on llm.request. They are not forwarded to direct LLM APIs.
+	SessionID string `json:"sessionId,omitempty"`
+	UserID    string `json:"userId,omitempty"`
 	// AccessProfile is the session's access profile ("client"|"developer");
 	// dev2-llm-service filters its own tool advertisement/enforcement with it.
 	AccessProfile string `json:"accessProfile,omitempty"`

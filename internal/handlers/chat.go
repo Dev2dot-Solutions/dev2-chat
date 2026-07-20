@@ -199,12 +199,16 @@ func (h *ChatHandler) DecideApproval(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Identity is taken from the persisted session, not the request body.
+	// Identity is taken from the persisted approval/session, not the request body.
+	approvalUserID := rec.UserID
+	if approvalUserID == "" {
+		approvalUserID = session.UserID
+	}
 	toolResp, err := h.natsClient.RequestToolApproval(&models.ToolApprovalRequest{
 		ApprovalID: rec.ID,
 		Decision:   req.Decision,
 		SessionID:  session.ID,
-		UserID:     session.UserID,
+		UserID:     approvalUserID,
 	})
 	if err != nil {
 		log.Printf("[chat] tool.approve failed for %s: %v", approvalID, err)

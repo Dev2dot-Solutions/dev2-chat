@@ -61,6 +61,10 @@ func (h *AgentHandler) Ask(w http.ResponseWriter, r *http.Request) {
 		respondError(w, http.StatusBadRequest, "invalid request body")
 		return
 	}
+	if companyID := GetCompanyID(r); companyID != "" {
+		// Authenticated company identity wins whenever the token carries it.
+		req.CompanyID = companyID
+	}
 	if req.CompanyID == "" || req.Question == "" {
 		respondError(w, http.StatusBadRequest, "companyId and question are required")
 		return
@@ -72,6 +76,17 @@ func (h *AgentHandler) Ask(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	profile := models.NormalizeAccessProfile(session.AccessProfile)
+	actorUserID := GetUserID(r)
+	if actorUserID == "" {
+		actorUserID = session.UserID
+	}
+	// From this point onward all identity/scoping comes from authenticated or
+	// persisted session state, never from the request body.
+	req.CompanyID = session.CompanyID
+	req.UserID = actorUserID
+	req.ConversationID = session.ID
+	req.ProjectID = session.ProjectID
+	req.AccessProfile = profile
 
 	knowledgeContext := h.searchKnowledge(r, req)
 	systemPrompt := "You are a helpful AI assistant for the Dev2Knowledge platform. " +
@@ -87,7 +102,7 @@ func (h *AgentHandler) Ask(w http.ResponseWriter, r *http.Request) {
 	llmReq := h.buildLLMRequest(systemPrompt, history, req, profile, project)
 	finalAnswer, toolCallResults, pendingApprovals := h.processLLMResponse(r, session, llmReq, req, profile, project)
 
-	h.recordPendingApprovals(r, session, pendingApprovals)
+	h.recordPendingApprovals(r, session, actorUserID, pendingApprovals)
 
 	assistantMsg := &models.ChatMessage{
 		SessionID:        session.ID,
@@ -276,14 +291,16 @@ func (h *AgentHandler) searchKnowledge(r *http.Request, req models.ChatRequest) 
 
 func (h *AgentHandler) buildLLMRequest(systemPrompt string, history []models.ChatMessage, req models.ChatRequest, profile string, project *models.CompanyProject) *models.LLMRequest {
 	llmReq := &models.LLMRequest{
-		Model:         h.llmModel,
-		MaxTokens:     4096,
-		Tools:         h.toolExecutor.ToolDefinitions(profile),
-		AccessProfile: profile,
+		Model:              h.llmModel,
+		MaxTokens:          4096,
+		Tools:              h.toolExecutor.ToolDefinitions(profile),
+		AccessProfile:      profile,
+		SessionID:          req.ConversationID,
+		UserID:             req.UserID,
+		WorkspaceCompanyID: req.CompanyID,
+		WorkspaceProjectID: req.ProjectID,
 	}
 	if project != nil {
-		llmReq.WorkspaceCompanyID = project.CompanyID
-		llmReq.WorkspaceProjectID = project.ID
 		llmReq.WorkspacePTProjectKey = project.ProjectTrackerKey
 	}
 	llmReq.Messages = append(llmReq.Messages, models.LLMMessage{Role: "system", Content: systemPrompt})
@@ -326,7 +343,9 @@ func (h *AgentHandler) processLLMResponse(r *http.Request, session *models.ChatS
 
 		execCtx := tools.ExecContext{
 			CompanyID:     req.CompanyID,
-			UserID:        session.UserID,
+			UserID:        req.UserID,
+			SessionID:     session.ID,
+			ProjectID:     session.ProjectID,
 			AccessProfile: profile,
 		}
 		if project != nil {
@@ -400,7 +419,7 @@ func parsePendingApprovals(results []models.LLMToolResult) []models.PendingAppro
 // recordPendingApprovals persists the approvalId → session mapping used by
 // the decision endpoint to resolve ownership (DEV2-108). Best-effort: a
 // persistence failure is logged but does not fail the chat response.
-func (h *AgentHandler) recordPendingApprovals(r *http.Request, session *models.ChatSession, approvals []models.PendingApproval) {
+func (h *AgentHandler) recordPendingApprovals(r *http.Request, session *models.ChatSession, actorUserID string, approvals []models.PendingApproval) {
 	if h.approvalRepo == nil {
 		return
 	}
@@ -409,7 +428,7 @@ func (h *AgentHandler) recordPendingApprovals(r *http.Request, session *models.C
 			ID:        pa.ApprovalID,
 			SessionID: session.ID,
 			CompanyID: session.CompanyID,
-			UserID:    session.UserID,
+			UserID:    actorUserID,
 			Tool:      pa.Tool,
 			Summary:   pa.Summary,
 			Preview:   pa.Preview,

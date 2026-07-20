@@ -37,12 +37,12 @@ var (
 )
 
 type jwkKey struct {
-	Kid string   `json:"kid"`
-	Kty string   `json:"kty"`
-	Alg string   `json:"alg"`
-	N   string   `json:"n"`
-	E   string   `json:"e"`
-	Use string   `json:"use"`
+	Kid string `json:"kid"`
+	Kty string `json:"kty"`
+	Alg string `json:"alg"`
+	N   string `json:"n"`
+	E   string `json:"e"`
+	Use string `json:"use"`
 }
 
 type jwksResponse struct {
@@ -240,6 +240,10 @@ func AuthMiddleware(next http.Handler) http.Handler {
 		sub, _ := claims["sub"].(string)
 		email, _ := claims["email"].(string)
 		name, _ := claims["name"].(string)
+		companyID, _ := claims["companyId"].(string)
+		if companyID == "" {
+			companyID, _ = claims["company_id"].(string)
+		}
 
 		// Check admin group
 		isAdmin := false
@@ -254,6 +258,9 @@ func AuthMiddleware(next http.Handler) http.Handler {
 
 		// Set claims on context
 		ctx := context.WithValue(r.Context(), ContextUserID, sub)
+		if companyID != "" {
+			ctx = context.WithValue(ctx, ContextCompanyID, companyID)
+		}
 		ctx = context.WithValue(ctx, ContextUserEmail, email)
 		ctx = context.WithValue(ctx, ContextUserName, name)
 		ctx = context.WithValue(ctx, ContextIsAdmin, isAdmin)
@@ -265,6 +272,15 @@ func AuthMiddleware(next http.Handler) http.Handler {
 // GetUserID extracts the authenticated user ID from the request context.
 func GetUserID(r *http.Request) string {
 	if v, ok := r.Context().Value(ContextUserID).(string); ok {
+		return v
+	}
+	return ""
+}
+
+// GetCompanyID extracts a company identity when the authentication provider
+// includes one. Not all service/admin tokens are bound to a single company.
+func GetCompanyID(r *http.Request) string {
+	if v, ok := r.Context().Value(ContextCompanyID).(string); ok {
 		return v
 	}
 	return ""

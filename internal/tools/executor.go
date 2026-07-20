@@ -4,16 +4,20 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"strconv"
+	"time"
 
 	"github.com/Dev2dot-Solutions/dev2-chat/internal/models"
+	"github.com/google/uuid"
 )
 
 // Executor routes tool calls from the LLM to the appropriate handler.
 type Executor struct {
-	knowledgeRepo KnowledgeProvider
-	ticketsClient TicketsClient
-	ptClient      PtClientProvider
-	ptConfigFn    func(ctx context.Context, companyID string) (*models.PtConfig, error)
+	knowledgeRepo  KnowledgeProvider
+	ticketsClient  TicketsClient
+	ptClient       PtClientProvider
+	ptConfigFn     func(ctx context.Context, companyID string) (*models.PtConfig, error)
+	auditPublisher AuditPublisher
 }
 
 // KnowledgeProvider interface for knowledge graph lookups.
@@ -25,10 +29,15 @@ type KnowledgeProvider interface {
 
 // TicketsClient interface for ticket operations (calls dev2-tickets via HTTP).
 type TicketsClient interface {
-	CreateTicket(ctx context.Context, companyID, title, description, ticketType, createdBy string, priority int) (map[string]any, error)
+	CreateTicket(ctx context.Context, companyID, title, description, ticketType, createdBy string, priority int, attribution models.TicketAttribution) (map[string]any, error)
 	GetTicket(ctx context.Context, ticketID string) (map[string]any, error)
 	ListTickets(ctx context.Context, companyID string, status, ticketType, assignedTo, search string, limit int) ([]map[string]any, error)
 	AddComment(ctx context.Context, ticketID, authorID, body string) (map[string]any, error)
+}
+
+// AuditPublisher emits local tool invocation audit events.
+type AuditPublisher interface {
+	PublishToolInvocation(event models.ToolAuditEvent)
 }
 
 // PtClientProvider interface for Project Tracker operations.
@@ -40,12 +49,13 @@ type PtClientProvider interface {
 }
 
 // NewExecutor creates a new tool executor.
-func NewExecutor(kr KnowledgeProvider, tc TicketsClient, ptc PtClientProvider, ptFn func(ctx context.Context, companyID string) (*models.PtConfig, error)) *Executor {
+func NewExecutor(kr KnowledgeProvider, tc TicketsClient, ptc PtClientProvider, ptFn func(ctx context.Context, companyID string) (*models.PtConfig, error), auditPublisher AuditPublisher) *Executor {
 	return &Executor{
-		knowledgeRepo: kr,
-		ticketsClient: tc,
-		ptClient:      ptc,
-		ptConfigFn:    ptFn,
+		knowledgeRepo:  kr,
+		ticketsClient:  tc,
+		ptClient:       ptc,
+		ptConfigFn:     ptFn,
+		auditPublisher: auditPublisher,
 	}
 }
 
@@ -53,11 +63,16 @@ func NewExecutor(kr KnowledgeProvider, tc TicketsClient, ptc PtClientProvider, p
 type ExecContext struct {
 	CompanyID string
 	UserID    string
+	SessionID string
+	ProjectID string
 	// AccessProfile is the session's access profile ("client"|"developer").
 	AccessProfile string
 	// PTProjectKey overrides the company-default PT project key when the
 	// session is bound to a Dev2Project with a projectTrackerKey.
 	PTProjectKey string
+	// PersonaName is intentionally empty today: dev2-chat does not resolve the
+	// active llm-service persona and must not fabricate one for audit events.
+	PersonaName string
 }
 
 // profileToolsets maps each access profile to the local tools it may use —
@@ -289,7 +304,33 @@ func (e *Executor) ToolDefinitions(profile string) []models.ToolDefinition {
 // Execute runs a single tool call and returns the result as a JSON string.
 // Tools outside the session's access profile are rejected at dispatch even if
 // the LLM hallucinates them (defense in depth — they were never advertised).
-func (e *Executor) Execute(ctx context.Context, toolCall models.LLMToolCall, exec ExecContext) string {
+func (e *Executor) Execute(ctx context.Context, toolCall models.LLMToolCall, exec ExecContext) (result string) {
+	started := time.Now()
+	auditArguments := toolCall.Function.Arguments
+	defer func() {
+		if e.auditPublisher == nil {
+			return
+		}
+		errMsg := auditResultError(result)
+		event := models.ToolAuditEvent{
+			EventID:       uuid.NewString(),
+			Timestamp:     started.UTC(),
+			CompanyID:     truncateAuditValue(exec.CompanyID, maxAuditIdentityBytes),
+			ProjectID:     truncateAuditValue(exec.ProjectID, maxAuditIdentityBytes),
+			UserID:        truncateAuditValue(exec.UserID, maxAuditIdentityBytes),
+			SessionID:     truncateAuditValue(exec.SessionID, maxAuditIdentityBytes),
+			AccessProfile: models.NormalizeAccessProfile(exec.AccessProfile),
+			PersonaName:   truncateAuditValue(exec.PersonaName, maxAuditNameBytes),
+			ToolName:      truncateAuditValue(toolCall.Function.Name, maxAuditNameBytes),
+			Arguments:     redactAuditArguments(auditArguments),
+			Result:        truncateAuditValue(redactAuditResult(result), maxAuditResultBytes),
+			Error:         truncateAuditValue(errMsg, maxAuditErrorBytes),
+			LatencyMS:     strconv.FormatInt(time.Since(started).Milliseconds(), 10),
+			Success:       errMsg == "",
+		}
+		go e.auditPublisher.PublishToolInvocation(event)
+	}()
+
 	profile := models.NormalizeAccessProfile(exec.AccessProfile)
 	if !ProfileAllows(profile, toolCall.Function.Name) {
 		return jsonError(fmt.Sprintf("tool %q is not available for the %s profile", toolCall.Function.Name, profile))
@@ -305,11 +346,14 @@ func (e *Executor) Execute(ctx context.Context, toolCall models.LLMToolCall, exe
 	if exec.CompanyID != "" {
 		args["companyId"] = exec.CompanyID
 	}
-	if _, ok := args["createdBy"]; !ok && exec.UserID != "" && toolCall.Function.Name == "create_ticket" {
+	if exec.UserID != "" && toolCall.Function.Name == "create_ticket" {
 		args["createdBy"] = exec.UserID
 	}
-	if _, ok := args["authorId"]; !ok && exec.UserID != "" && toolCall.Function.Name == "add_comment" {
+	if exec.UserID != "" && toolCall.Function.Name == "add_comment" {
 		args["authorId"] = exec.UserID
+	}
+	if effectiveArgs, err := json.Marshal(args); err == nil {
+		auditArguments = string(effectiveArgs)
 	}
 
 	switch toolCall.Function.Name {
@@ -318,7 +362,7 @@ func (e *Executor) Execute(ctx context.Context, toolCall models.LLMToolCall, exe
 	case "get_entity":
 		return e.execGetEntity(ctx, args)
 	case "create_ticket":
-		return e.execCreateTicket(ctx, args)
+		return e.execCreateTicket(ctx, exec, args)
 	case "get_ticket":
 		return e.execGetTicket(ctx, args)
 	case "list_tickets":
@@ -375,7 +419,7 @@ func (e *Executor) execGetEntity(ctx context.Context, args map[string]any) strin
 
 // ── Ticket Tools ────────────────────────────────────────────────────────────
 
-func (e *Executor) execCreateTicket(ctx context.Context, args map[string]any) string {
+func (e *Executor) execCreateTicket(ctx context.Context, exec ExecContext, args map[string]any) string {
 	companyID, _ := args["companyId"].(string)
 	title, _ := args["title"].(string)
 	description, _ := args["description"].(string)
@@ -390,7 +434,12 @@ func (e *Executor) execCreateTicket(ctx context.Context, args map[string]any) st
 		return jsonError("companyId, title, and createdBy are required")
 	}
 
-	result, err := e.ticketsClient.CreateTicket(ctx, companyID, title, description, ticketType, createdBy, priority)
+	result, err := e.ticketsClient.CreateTicket(ctx, companyID, title, description, ticketType, createdBy, priority, models.TicketAttribution{
+		Origin:          models.NormalizeAccessProfile(exec.AccessProfile),
+		SourceUserID:    exec.UserID,
+		SourceSessionID: exec.SessionID,
+		SourceProjectID: exec.ProjectID,
+	})
 	if err != nil {
 		return jsonError("create ticket failed: " + err.Error())
 	}
@@ -548,6 +597,21 @@ func (e *Executor) execCreatePtItem(ctx context.Context, exec ExecContext, args 
 	result, err := e.ptClient.CreateItem(ptConfig.Token, ptConfig.ProjectKey, item)
 	if err != nil {
 		return jsonError("create PT item failed: " + err.Error())
+	}
+	if result == nil || result.Key == "" {
+		return jsonError("PT item created but response did not include an item key for attribution")
+	}
+	attribution := fmt.Sprintf(
+		"Created via Dev2 %s chat by user %s, conversation %s, Dev2Project %s.",
+		models.NormalizeAccessProfile(exec.AccessProfile), exec.UserID, exec.SessionID, attributionProjectID(exec.ProjectID),
+	)
+	createdKey := result.Key
+	updated, err := e.ptClient.UpdateItem(ptConfig.Token, createdKey, map[string]any{"changeLog": attribution})
+	if err != nil {
+		return jsonError(fmt.Sprintf("PT item %s created but attribution changeLog failed: %s", createdKey, err.Error()))
+	}
+	if updated != nil {
+		result = updated
 	}
 	data, _ := json.Marshal(result)
 	return string(data)
