@@ -24,9 +24,9 @@ func (h *SettingsHandler) Routes(r chi.Router) {
 }
 
 func (h *SettingsHandler) GetLLMConfig(w http.ResponseWriter, r *http.Request) {
-	companyID := r.URL.Query().Get("company_id")
+	companyID := r.URL.Query().Get("companyId")
 	if !isValidUUID(companyID) {
-		respondError(w, http.StatusBadRequest, "missing or invalid company_id")
+		respondError(w, http.StatusBadRequest, "missing or invalid companyId")
 		return
 	}
 
@@ -41,9 +41,9 @@ func (h *SettingsHandler) GetLLMConfig(w http.ResponseWriter, r *http.Request) {
 }
 
 func (h *SettingsHandler) GetPTConfig(w http.ResponseWriter, r *http.Request) {
-	companyID := r.URL.Query().Get("company_id")
+	companyID := r.URL.Query().Get("companyId")
 	if !isValidUUID(companyID) {
-		respondError(w, http.StatusBadRequest, "missing or invalid company_id")
+		respondError(w, http.StatusBadRequest, "missing or invalid companyId")
 		return
 	}
 

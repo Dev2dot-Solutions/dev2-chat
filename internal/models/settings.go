@@ -4,19 +4,19 @@ package models
 type LlmConfig struct {
 	Provider string `bson:"provider" json:"provider"`
 	Model    string `bson:"model" json:"model"`
-	APIKey   string `bson:"api_key,omitempty" json:"-"`
-	BaseURL  string `bson:"base_url,omitempty" json:"base_url,omitempty"`
+	APIKey   string `bson:"apiKey,omitempty" json:"-"`
+	BaseURL  string `bson:"baseUrl,omitempty" json:"baseUrl,omitempty"`
 }
 
 // PtConfig holds the Project Tracker configuration for a company.
 type PtConfig struct {
 	Token      string `bson:"token" json:"-"`
-	ProjectKey string `bson:"project_key" json:"project_key"`
+	ProjectKey string `bson:"projectKey" json:"projectKey"`
 }
 
 // CompanySettings holds all per-company settings.
 type CompanySettings struct {
-	CompanyID string    `bson:"_id" json:"company_id"`
+	CompanyID string    `bson:"_id" json:"companyId"`
 	LLM       LlmConfig `bson:"llm" json:"llm"`
 	PT        PtConfig  `bson:"pt" json:"pt"`
 }
@@ -96,7 +96,7 @@ type Usage struct {
 // KnowledgeSearchRequest is sent to dev2-knowledge for context search.
 type KnowledgeSearchRequest struct {
 	Query     string   `json:"query"`
-	CompanyID string   `json:"company_id"`
+	CompanyID string   `json:"companyId"`
 	Types     []string `json:"types,omitempty"`
 	Limit     int      `json:"limit,omitempty"`
 }
@@ -114,12 +114,12 @@ type KnowledgeSearchResult struct {
 type KnowledgeSearchResponse struct {
 	Query         string                  `json:"query"`
 	Results       map[string][]KnowledgeSearchResult `json:"results"`
-	TotalMatches  int                     `json:"total_matches"`
+	TotalMatches  int                     `json:"totalMatches"`
 }
 
 // KnowledgeEntityRequest requests a single entity by type + ID.
 type KnowledgeEntityRequest struct {
 	Type      string `json:"type"`
 	ID        string `json:"id"`
-	CompanyID string `json:"company_id,omitempty"`
+	CompanyID string `json:"companyId,omitempty"`
 }

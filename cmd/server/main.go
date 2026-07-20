@@ -44,6 +44,31 @@ func main() {
 	mongoDB := mongoClient.Database(cfg.MongoDatabase)
 	log.Printf("Connected to MongoDB: %s/%s", cfg.MongoURI, cfg.MongoDatabase)
 
+	// Startup migration: snake_case → lowerCamelCase document keys (idempotent)
+	repository.MigrateSnakeToCamel(ctx, mongoDB,
+		[]string{
+			"chat_sessions", "chat_messages", "companies",
+			"conventions", "business_rules", "architecture_decisions", "domain_terms", "processes",
+		},
+		map[string]string{
+			"company_id":      "companyId",
+			"user_id":         "userId",
+			"session_id":      "sessionId",
+			"conversation_id": "conversationId",
+			"token_count":     "tokenCount",
+			"message_count":   "messageCount",
+			"tool_calls":      "toolCalls",
+			"tool_call_id":    "toolCallId",
+			"project_key":     "projectKey",
+			"api_key":         "apiKey",
+			"base_url":        "baseUrl",
+			"ticket_id":       "ticketId",
+			"created_by":      "createdBy",
+			"assigned_to":     "assignedTo",
+			"created_at":      "createdAt",
+			"updated_at":      "updatedAt",
+		})
+
 	// Repositories
 	sessionRepo := repository.NewSessionRepo(mongoDB)
 	messageRepo := repository.NewMessageRepo(mongoDB)
@@ -103,6 +128,7 @@ func main() {
 		AllowCredentials: true,
 		MaxAge:           300,
 	}))
+	r.Use(handlers.AuthMiddleware)
 
 	// Health
 	r.Get("/health", func(w http.ResponseWriter, r *http.Request) {

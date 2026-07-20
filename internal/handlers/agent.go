@@ -57,7 +57,7 @@ func (h *AgentHandler) Ask(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if req.CompanyID == "" || req.Question == "" {
-		respondError(w, http.StatusBadRequest, "company_id and question are required")
+		respondError(w, http.StatusBadRequest, "companyId and question are required")
 		return
 	}
 

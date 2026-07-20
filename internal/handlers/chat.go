@@ -37,12 +37,12 @@ func (h *ChatHandler) SendMessage(w http.ResponseWriter, r *http.Request) {
 
 // ListSessions handles GET /chat/sessions
 func (h *ChatHandler) ListSessions(w http.ResponseWriter, r *http.Request) {
-	companyID := r.URL.Query().Get("company_id")
+	companyID := r.URL.Query().Get("companyId")
 	if !isValidUUID(companyID) {
-		respondError(w, http.StatusBadRequest, "missing or invalid company_id")
+		respondError(w, http.StatusBadRequest, "missing or invalid companyId")
 		return
 	}
-	userID := r.URL.Query().Get("user_id")
+	userID := r.URL.Query().Get("userId")
 	limit, _ := strconv.Atoi(r.URL.Query().Get("limit"))
 	offset, _ := strconv.Atoi(r.URL.Query().Get("offset"))
 

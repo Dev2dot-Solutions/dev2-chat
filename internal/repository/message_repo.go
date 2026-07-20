@@ -36,8 +36,8 @@ func (r *MessageRepo) ListBySession(ctx context.Context, sessionID string, limit
 	if limit <= 0 {
 		limit = 50
 	}
-	cursor, err := r.coll.Find(ctx, bson.M{"session_id": sessionID},
-		options.Find().SetSort(bson.M{"created_at": 1}).SetLimit(int64(limit)))
+	cursor, err := r.coll.Find(ctx, bson.M{"sessionId": sessionID},
+		options.Find().SetSort(bson.M{"createdAt": 1}).SetLimit(int64(limit)))
 	if err != nil {
 		return nil, fmt.Errorf("find messages: %w", err)
 	}
@@ -54,7 +54,7 @@ func (r *MessageRepo) ListBySession(ctx context.Context, sessionID string, limit
 }
 
 func (r *MessageRepo) CountBySession(ctx context.Context, sessionID string) (int, error) {
-	count, err := r.coll.CountDocuments(ctx, bson.M{"session_id": sessionID})
+	count, err := r.coll.CountDocuments(ctx, bson.M{"sessionId": sessionID})
 	if err != nil {
 		return 0, fmt.Errorf("count messages: %w", err)
 	}
@@ -63,8 +63,8 @@ func (r *MessageRepo) CountBySession(ctx context.Context, sessionID string) (int
 
 func (r *MessageRepo) GetLastBySession(ctx context.Context, sessionID string) (*models.ChatMessage, error) {
 	var msg models.ChatMessage
-	err := r.coll.FindOne(ctx, bson.M{"session_id": sessionID},
-		options.FindOne().SetSort(bson.M{"created_at": -1})).Decode(&msg)
+	err := r.coll.FindOne(ctx, bson.M{"sessionId": sessionID},
+		options.FindOne().SetSort(bson.M{"createdAt": -1})).Decode(&msg)
 	if err == mongo.ErrNoDocuments {
 		return nil, nil
 	}

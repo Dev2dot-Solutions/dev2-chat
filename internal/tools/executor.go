@@ -61,9 +61,9 @@ func (e *Executor) ToolDefinitions() []models.ToolDefinition {
 					"type": "object",
 					"properties": map[string]any{
 						"query":      map[string]any{"type": "string", "description": "Search query"},
-						"company_id": map[string]any{"type": "string", "format": "uuid"},
+						"companyId": map[string]any{"type": "string", "format": "uuid"},
 					},
-					"required": []string{"query", "company_id"},
+					"required": []string{"query", "companyId"},
 				},
 			},
 		},
@@ -77,9 +77,9 @@ func (e *Executor) ToolDefinitions() []models.ToolDefinition {
 					"properties": map[string]any{
 						"type":       map[string]any{"type": "string", "enum": []string{"conventions", "business_rules", "domain_terms", "architecture_decisions", "processes", "functions", "classes", "files", "tickets"}},
 						"id":         map[string]any{"type": "string", "format": "uuid"},
-						"company_id": map[string]any{"type": "string", "format": "uuid"},
+						"companyId": map[string]any{"type": "string", "format": "uuid"},
 					},
-					"required": []string{"type", "id", "company_id"},
+					"required": []string{"type", "id", "companyId"},
 				},
 			},
 		},
@@ -91,14 +91,14 @@ func (e *Executor) ToolDefinitions() []models.ToolDefinition {
 				Parameters: map[string]any{
 					"type": "object",
 					"properties": map[string]any{
-						"company_id":  map[string]any{"type": "string", "format": "uuid"},
+						"companyId":  map[string]any{"type": "string", "format": "uuid"},
 						"title":       map[string]any{"type": "string"},
 						"description": map[string]any{"type": "string"},
 						"type":        map[string]any{"type": "string", "enum": []string{"bug", "feature", "task", "improvement"}},
 						"priority":    map[string]any{"type": "integer", "minimum": 1, "maximum": 5},
-						"created_by":  map[string]any{"type": "string", "format": "uuid"},
+						"createdBy":  map[string]any{"type": "string", "format": "uuid"},
 					},
-					"required": []string{"company_id", "title", "description", "created_by"},
+					"required": []string{"companyId", "title", "description", "createdBy"},
 				},
 			},
 		},
@@ -110,9 +110,9 @@ func (e *Executor) ToolDefinitions() []models.ToolDefinition {
 				Parameters: map[string]any{
 					"type": "object",
 					"properties": map[string]any{
-						"ticket_id": map[string]any{"type": "string", "format": "uuid"},
+						"ticketId": map[string]any{"type": "string", "format": "uuid"},
 					},
-					"required": []string{"ticket_id"},
+					"required": []string{"ticketId"},
 				},
 			},
 		},
@@ -124,14 +124,14 @@ func (e *Executor) ToolDefinitions() []models.ToolDefinition {
 				Parameters: map[string]any{
 					"type": "object",
 					"properties": map[string]any{
-						"company_id":  map[string]any{"type": "string", "format": "uuid"},
+						"companyId":  map[string]any{"type": "string", "format": "uuid"},
 						"status":      map[string]any{"type": "string", "enum": []string{"open", "in_progress", "resolved", "closed"}},
 						"type":        map[string]any{"type": "string", "enum": []string{"bug", "feature", "task", "improvement"}},
-						"assigned_to": map[string]any{"type": "string", "format": "uuid"},
+						"assignedTo": map[string]any{"type": "string", "format": "uuid"},
 						"search":      map[string]any{"type": "string"},
 						"limit":       map[string]any{"type": "integer", "maximum": 50},
 					},
-					"required": []string{"company_id"},
+					"required": []string{"companyId"},
 				},
 			},
 		},
@@ -143,11 +143,11 @@ func (e *Executor) ToolDefinitions() []models.ToolDefinition {
 				Parameters: map[string]any{
 					"type": "object",
 					"properties": map[string]any{
-						"ticket_id": map[string]any{"type": "string", "format": "uuid"},
-						"author_id": map[string]any{"type": "string", "format": "uuid"},
+						"ticketId": map[string]any{"type": "string", "format": "uuid"},
+						"authorId": map[string]any{"type": "string", "format": "uuid"},
 						"body":      map[string]any{"type": "string"},
 					},
-					"required": []string{"ticket_id", "author_id", "body"},
+					"required": []string{"ticketId", "authorId", "body"},
 				},
 			},
 		},
@@ -159,14 +159,14 @@ func (e *Executor) ToolDefinitions() []models.ToolDefinition {
 				Parameters: map[string]any{
 					"type": "object",
 					"properties": map[string]any{
-						"company_id":  map[string]any{"type": "string", "format": "uuid"},
+						"companyId":  map[string]any{"type": "string", "format": "uuid"},
 						"type":        map[string]any{"type": "string", "enum": []string{"story", "task"}},
 						"title":       map[string]any{"type": "string"},
 						"description": map[string]any{"type": "string"},
 						"priority":    map[string]any{"type": "string", "enum": []string{"low", "medium", "high", "critical"}},
 						"labels":      map[string]any{"type": "array", "items": map[string]any{"type": "string"}},
 					},
-					"required": []string{"company_id", "title", "description"},
+					"required": []string{"companyId", "title", "description"},
 				},
 			},
 		},
@@ -178,10 +178,10 @@ func (e *Executor) ToolDefinitions() []models.ToolDefinition {
 				Parameters: map[string]any{
 					"type": "object",
 					"properties": map[string]any{
-						"company_id": map[string]any{"type": "string", "format": "uuid"},
-						"item_key":   map[string]any{"type": "string", "description": "e.g. DEV2-15"},
+						"companyId": map[string]any{"type": "string", "format": "uuid"},
+						"itemKey":   map[string]any{"type": "string", "description": "e.g. DEV2-15"},
 					},
-					"required": []string{"company_id", "item_key"},
+					"required": []string{"companyId", "itemKey"},
 				},
 			},
 		},
@@ -193,10 +193,10 @@ func (e *Executor) ToolDefinitions() []models.ToolDefinition {
 				Parameters: map[string]any{
 					"type": "object",
 					"properties": map[string]any{
-						"company_id": map[string]any{"type": "string", "format": "uuid"},
+						"companyId": map[string]any{"type": "string", "format": "uuid"},
 						"query":      map[string]any{"type": "string"},
 					},
-					"required": []string{"company_id", "query"},
+					"required": []string{"companyId", "query"},
 				},
 			},
 		},
@@ -208,13 +208,13 @@ func (e *Executor) ToolDefinitions() []models.ToolDefinition {
 				Parameters: map[string]any{
 					"type": "object",
 					"properties": map[string]any{
-						"company_id":    map[string]any{"type": "string", "format": "uuid"},
-						"item_key":      map[string]any{"type": "string"},
+						"companyId":    map[string]any{"type": "string", "format": "uuid"},
+						"itemKey":      map[string]any{"type": "string"},
 						"status":        map[string]any{"type": "string", "enum": []string{"backlog", "todo", "in_progress", "review", "done", "blocked"}},
 						"priority":      map[string]any{"type": "string", "enum": []string{"low", "medium", "high", "critical"}},
 						"blockedReason": map[string]any{"type": "string"},
 					},
-					"required": []string{"company_id", "item_key"},
+					"required": []string{"companyId", "itemKey"},
 				},
 			},
 		},
@@ -229,14 +229,14 @@ func (e *Executor) Execute(ctx context.Context, toolCall models.LLMToolCall, com
 	}
 
 	// Inject context
-	if _, ok := args["company_id"]; !ok && companyID != "" {
-		args["company_id"] = companyID
+	if _, ok := args["companyId"]; !ok && companyID != "" {
+		args["companyId"] = companyID
 	}
-	if _, ok := args["created_by"]; !ok && userID != "" && toolCall.Function.Name == "create_ticket" {
-		args["created_by"] = userID
+	if _, ok := args["createdBy"]; !ok && userID != "" && toolCall.Function.Name == "create_ticket" {
+		args["createdBy"] = userID
 	}
-	if _, ok := args["author_id"]; !ok && userID != "" && toolCall.Function.Name == "add_comment" {
-		args["author_id"] = userID
+	if _, ok := args["authorId"]; !ok && userID != "" && toolCall.Function.Name == "add_comment" {
+		args["authorId"] = userID
 	}
 
 	switch toolCall.Function.Name {
@@ -269,9 +269,9 @@ func (e *Executor) Execute(ctx context.Context, toolCall models.LLMToolCall, com
 
 func (e *Executor) execSearchKnowledge(ctx context.Context, args map[string]any) string {
 	query, _ := args["query"].(string)
-	companyID, _ := args["company_id"].(string)
+	companyID, _ := args["companyId"].(string)
 	if query == "" || companyID == "" {
-		return jsonError("query and company_id are required")
+		return jsonError("query and companyId are required")
 	}
 
 	result, err := e.knowledgeRepo.SearchKnowledgeGraph(ctx, query, companyID, 5)
@@ -303,18 +303,18 @@ func (e *Executor) execGetEntity(ctx context.Context, args map[string]any) strin
 // ── Ticket Tools ────────────────────────────────────────────────────────────
 
 func (e *Executor) execCreateTicket(ctx context.Context, args map[string]any) string {
-	companyID, _ := args["company_id"].(string)
+	companyID, _ := args["companyId"].(string)
 	title, _ := args["title"].(string)
 	description, _ := args["description"].(string)
 	ticketType, _ := args["type"].(string)
-	createdBy, _ := args["created_by"].(string)
+	createdBy, _ := args["createdBy"].(string)
 	priority := 3
 	if p, ok := args["priority"].(float64); ok {
 		priority = int(p)
 	}
 
 	if companyID == "" || title == "" || createdBy == "" {
-		return jsonError("company_id, title, and created_by are required")
+		return jsonError("companyId, title, and createdBy are required")
 	}
 
 	result, err := e.ticketsClient.CreateTicket(ctx, companyID, title, description, ticketType, createdBy, priority)
@@ -326,9 +326,9 @@ func (e *Executor) execCreateTicket(ctx context.Context, args map[string]any) st
 }
 
 func (e *Executor) execGetTicket(ctx context.Context, args map[string]any) string {
-	ticketID, _ := args["ticket_id"].(string)
+	ticketID, _ := args["ticketId"].(string)
 	if ticketID == "" {
-		return jsonError("ticket_id is required")
+		return jsonError("ticketId is required")
 	}
 
 	result, err := e.ticketsClient.GetTicket(ctx, ticketID)
@@ -343,14 +343,14 @@ func (e *Executor) execGetTicket(ctx context.Context, args map[string]any) strin
 }
 
 func (e *Executor) execListTickets(ctx context.Context, args map[string]any) string {
-	companyID, _ := args["company_id"].(string)
+	companyID, _ := args["companyId"].(string)
 	if companyID == "" {
-		return jsonError("company_id is required")
+		return jsonError("companyId is required")
 	}
 
 	status, _ := args["status"].(string)
 	ticketType, _ := args["type"].(string)
-	assignedTo, _ := args["assigned_to"].(string)
+	assignedTo, _ := args["assignedTo"].(string)
 	search, _ := args["search"].(string)
 	limit := 20
 	if l, ok := args["limit"].(float64); ok {
@@ -366,11 +366,11 @@ func (e *Executor) execListTickets(ctx context.Context, args map[string]any) str
 }
 
 func (e *Executor) execAddComment(ctx context.Context, args map[string]any) string {
-	ticketID, _ := args["ticket_id"].(string)
-	authorID, _ := args["author_id"].(string)
+	ticketID, _ := args["ticketId"].(string)
+	authorID, _ := args["authorId"].(string)
 	body, _ := args["body"].(string)
 	if ticketID == "" || authorID == "" || body == "" {
-		return jsonError("ticket_id, author_id, and body are required")
+		return jsonError("ticketId, authorId, and body are required")
 	}
 
 	result, err := e.ticketsClient.AddComment(ctx, ticketID, authorID, body)
@@ -384,14 +384,14 @@ func (e *Executor) execAddComment(ctx context.Context, args map[string]any) stri
 // ── Project Tracker Tools ───────────────────────────────────────────────────
 
 func (e *Executor) execCreatePtItem(ctx context.Context, args map[string]any) string {
-	companyID, _ := args["company_id"].(string)
+	companyID, _ := args["companyId"].(string)
 	title, _ := args["title"].(string)
 	description, _ := args["description"].(string)
 	itemType, _ := args["type"].(string)
 	priority, _ := args["priority"].(string)
 
 	if companyID == "" || title == "" {
-		return jsonError("company_id and title are required")
+		return jsonError("companyId and title are required")
 	}
 
 	ptConfig, err := e.ptConfigFn(ctx, companyID)
@@ -445,10 +445,10 @@ func (e *Executor) execCreatePtItem(ctx context.Context, args map[string]any) st
 }
 
 func (e *Executor) execReadPtItem(ctx context.Context, args map[string]any) string {
-	companyID, _ := args["company_id"].(string)
-	itemKey, _ := args["item_key"].(string)
+	companyID, _ := args["companyId"].(string)
+	itemKey, _ := args["itemKey"].(string)
 	if companyID == "" || itemKey == "" {
-		return jsonError("company_id and item_key are required")
+		return jsonError("companyId and itemKey are required")
 	}
 
 	ptConfig, err := e.ptConfigFn(ctx, companyID)
@@ -465,10 +465,10 @@ func (e *Executor) execReadPtItem(ctx context.Context, args map[string]any) stri
 }
 
 func (e *Executor) execSearchPt(ctx context.Context, args map[string]any) string {
-	companyID, _ := args["company_id"].(string)
+	companyID, _ := args["companyId"].(string)
 	query, _ := args["query"].(string)
 	if companyID == "" || query == "" {
-		return jsonError("company_id and query are required")
+		return jsonError("companyId and query are required")
 	}
 
 	ptConfig, err := e.ptConfigFn(ctx, companyID)
@@ -485,10 +485,10 @@ func (e *Executor) execSearchPt(ctx context.Context, args map[string]any) string
 }
 
 func (e *Executor) execUpdatePtItem(ctx context.Context, args map[string]any) string {
-	companyID, _ := args["company_id"].(string)
-	itemKey, _ := args["item_key"].(string)
+	companyID, _ := args["companyId"].(string)
+	itemKey, _ := args["itemKey"].(string)
 	if companyID == "" || itemKey == "" {
-		return jsonError("company_id and item_key are required")
+		return jsonError("companyId and itemKey are required")
 	}
 
 	ptConfig, err := e.ptConfigFn(ctx, companyID)

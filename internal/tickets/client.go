@@ -51,7 +51,7 @@ func (c *Client) doRequest(method, path string, body any) ([]byte, error) {
 
 func (c *Client) CreateTicket(ctx context.Context, companyID, title, description, ticketType, createdBy string, priority int) (map[string]any, error) {
 	body := map[string]any{
-		"company_id": companyID, "title": title, "created_by": createdBy,
+		"companyId": companyID, "title": title, "createdBy": createdBy,
 	}
 	if description != "" {
 		body["description"] = description
@@ -86,7 +86,7 @@ func (c *Client) GetTicket(ctx context.Context, ticketID string) (map[string]any
 }
 
 func (c *Client) ListTickets(ctx context.Context, companyID, status, ticketType, assignedTo, search string, limit int) ([]map[string]any, error) {
-	path := fmt.Sprintf("/tickets?company_id=%s", companyID)
+	path := fmt.Sprintf("/tickets?companyId=%s", companyID)
 	if status != "" {
 		path += "&status=" + status
 	}
@@ -94,7 +94,7 @@ func (c *Client) ListTickets(ctx context.Context, companyID, status, ticketType,
 		path += "&type=" + ticketType
 	}
 	if assignedTo != "" {
-		path += "&assigned_to=" + assignedTo
+		path += "&assignedTo=" + assignedTo
 	}
 	if search != "" {
 		path += "&search=" + search
@@ -116,7 +116,7 @@ func (c *Client) ListTickets(ctx context.Context, companyID, status, ticketType,
 }
 
 func (c *Client) AddComment(ctx context.Context, ticketID, authorID, body string) (map[string]any, error) {
-	reqBody := map[string]any{"author_id": authorID, "body": body}
+	reqBody := map[string]any{"authorId": authorID, "body": body}
 	respBody, err := c.doRequest("POST", "/tickets/"+ticketID+"/comments", reqBody)
 	if err != nil {
 		return nil, err

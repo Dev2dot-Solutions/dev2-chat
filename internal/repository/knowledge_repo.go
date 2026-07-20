@@ -26,9 +26,9 @@ func (r *KnowledgeRepo) SearchEntityByText(ctx context.Context, collection, quer
 	coll := r.db.Collection(collection)
 	filter := bson.M{"$text": bson.M{"$search": query}}
 	if companyID != "" {
-		// Only add company_id filter if the collection has it (conventions, business_rules, etc.)
+		// Only add companyId filter if the collection has it (conventions, business_rules, etc.)
 		// We include it even for non-tenant-scoped collections — $text will match regardless
-		filter["company_id"] = companyID
+		filter["companyId"] = companyID
 	}
 
 	cur, err := coll.Find(ctx, filter,

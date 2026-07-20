@@ -56,8 +56,41 @@ func (c *Client) RequestLLM(req *models.LLMRequest) (*models.LLMResponse, error)
 		return nil, fmt.Errorf("NATS not connected")
 	}
 	sessionID := fmt.Sprintf("chat-%d", time.Now().UnixNano())
+
+	// Build a NATSRequest-compatible payload
+	// Extract system prompt from messages
+	systemPrompt := ""
+	var history []map[string]interface{}
+	for _, msg := range req.Messages {
+		if msg.Role == "system" {
+			systemPrompt = msg.Content
+			continue
+		}
+		history = append(history, map[string]interface{}{
+			"role":    msg.Role,
+			"content": msg.Content,
+		})
+	}
+
+	// Find the latest user message
+	latestMessage := ""
+	for i := len(req.Messages) - 1; i >= 0; i-- {
+		if req.Messages[i].Role == "user" {
+			latestMessage = req.Messages[i].Content
+			break
+		}
+	}
+
+	natsReq := map[string]interface{}{
+		"sessionId":           sessionID,
+		"systemPrompt":        systemPrompt,
+		"conversationHistory": history,
+		"latestMessage":       latestMessage,
+		"modelOverride":       req.Model,
+	}
+
 	var resp models.LLMResponse
-	err := c.enc.Request(fmt.Sprintf("%s.%s", SubjectLLMRequest, sessionID), req, &resp, 120*time.Second)
+	err := c.enc.Request(fmt.Sprintf("%s.%s", SubjectLLMRequest, sessionID), natsReq, &resp, 120*time.Second)
 	if err != nil {
 		return nil, fmt.Errorf("llm.request failed: %w", err)
 	}
@@ -70,9 +103,9 @@ func (c *Client) PublishSessionCreated(session *models.ChatSession) {
 		return
 	}
 	event := map[string]any{
-		"session_id": session.ID,
-		"company_id": session.CompanyID,
-		"user_id":    session.UserID,
+		"sessionId": session.ID,
+		"companyId": session.CompanyID,
+		"userId":    session.UserID,
 		"title":      session.Title,
 		"timestamp":  time.Now().UTC().Format(time.RFC3339),
 	}
@@ -87,11 +120,11 @@ func (c *Client) PublishMessageSent(sessionID, companyID, userID, role, content 
 		return
 	}
 	event := map[string]any{
-		"session_id":      sessionID,
-		"company_id":      companyID,
-		"user_id":         userID,
+		"sessionId":      sessionID,
+		"companyId":      companyID,
+		"userId":         userID,
 		"role":            role,
-		"content_preview": truncate(content, 200),
+		"contentPreview": truncate(content, 200),
 		"timestamp":       time.Now().UTC().Format(time.RFC3339),
 	}
 	if err := c.enc.Publish(SubjectChatMessageSent, event); err != nil {

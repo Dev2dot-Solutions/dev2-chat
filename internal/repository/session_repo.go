@@ -61,9 +61,9 @@ func (r *SessionRepo) GetByID(ctx context.Context, id string) (*models.ChatSessi
 }
 
 func (r *SessionRepo) ListByCompany(ctx context.Context, companyID, userID string, limit, offset int) (*models.SessionListResponse, error) {
-	filter := bson.M{"company_id": companyID}
+	filter := bson.M{"companyId": companyID}
 	if userID != "" {
-		filter["user_id"] = userID
+		filter["userId"] = userID
 	}
 
 	total, err := r.coll.CountDocuments(ctx, filter)
@@ -79,7 +79,7 @@ func (r *SessionRepo) ListByCompany(ctx context.Context, companyID, userID strin
 	}
 
 	cursor, err := r.coll.Find(ctx, filter,
-		options.Find().SetSort(bson.M{"updated_at": -1}).SetSkip(int64(offset)).SetLimit(int64(limit)))
+		options.Find().SetSort(bson.M{"updatedAt": -1}).SetSkip(int64(offset)).SetLimit(int64(limit)))
 	if err != nil {
 		return nil, fmt.Errorf("find sessions: %w", err)
 	}
@@ -105,11 +105,11 @@ func (r *SessionRepo) ListByCompany(ctx context.Context, companyID, userID strin
 }
 
 func (r *SessionRepo) UpdateTitle(ctx context.Context, id, title string) error {
-	_, err := r.coll.UpdateOne(ctx, bson.M{"_id": id}, bson.M{"$set": bson.M{"title": title, "updated_at": time.Now().UTC()}})
+	_, err := r.coll.UpdateOne(ctx, bson.M{"_id": id}, bson.M{"$set": bson.M{"title": title, "updatedAt": time.Now().UTC()}})
 	return err
 }
 
 func (r *SessionRepo) UpdateTokenCount(ctx context.Context, id string, count int) error {
-	_, err := r.coll.UpdateOne(ctx, bson.M{"_id": id}, bson.M{"$set": bson.M{"token_count": count, "updated_at": time.Now().UTC()}})
+	_, err := r.coll.UpdateOne(ctx, bson.M{"_id": id}, bson.M{"$set": bson.M{"tokenCount": count, "updatedAt": time.Now().UTC()}})
 	return err
 }
