@@ -36,3 +36,10 @@ func TestLocalhostDefaultRequiresDevelopmentEnvironment(t *testing.T) {
 		})
 	}
 }
+
+func TestTrustedProxyCIDRsAreValidated(t *testing.T) {
+	t.Setenv("CHAT_SOCKET_TRUSTED_PROXY_CIDRS", "not-a-cidr")
+	if _, err := Load(); err == nil {
+		t.Fatal("invalid trusted proxy CIDR accepted")
+	}
+}

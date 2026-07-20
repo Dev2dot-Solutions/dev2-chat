@@ -50,6 +50,7 @@ type socketStore interface {
 
 type SocketOptions struct {
 	AllowedOrigins       []string
+	TrustedProxyCIDRs    []string
 	SendQueue            int
 	ReadLimit            int64
 	PingInterval         time.Duration
@@ -65,16 +66,22 @@ type SocketOptions struct {
 }
 
 type SocketHandler struct {
-	store    socketStore
-	agent    *AgentHandler
-	chat     *ChatHandler
-	options  SocketOptions
-	upgrader websocket.Upgrader
+	store          socketStore
+	agent          *AgentHandler
+	chat           *ChatHandler
+	options        SocketOptions
+	trustedProxies []*net.IPNet
+	upgrader       websocket.Upgrader
 }
 
 func NewSocketHandler(store socketStore, agent *AgentHandler, chat *ChatHandler, options SocketOptions) *SocketHandler {
 	applySocketDefaults(&options)
 	h := &SocketHandler{store: store, agent: agent, chat: chat, options: options}
+	for _, cidr := range options.TrustedProxyCIDRs {
+		if _, network, err := net.ParseCIDR(strings.TrimSpace(cidr)); err == nil {
+			h.trustedProxies = append(h.trustedProxies, network)
+		}
+	}
 	h.upgrader = websocket.Upgrader{
 		HandshakeTimeout: 10 * time.Second,
 		Subprotocols:     []string{baseProtocol},
@@ -245,7 +252,7 @@ func (h *SocketHandler) Connect(w http.ResponseWriter, r *http.Request) {
 		respondError(w, http.StatusUnauthorized, "invalid or expired socket ticket")
 		return
 	}
-	lease, err := h.store.AcquireConnection(r.Context(), ticket.SocketIdentity, remoteIP(r), h.options.ConnectionPolicy, now)
+	lease, err := h.store.AcquireConnection(r.Context(), ticket.SocketIdentity, h.remoteIP(r), h.options.ConnectionPolicy, now)
 	if errors.Is(err, repository.ErrSocketCapacity) || errors.Is(err, repository.ErrSocketRateLimited) {
 		respondError(w, http.StatusTooManyRequests, "socket connection limit reached")
 		return
@@ -924,12 +931,48 @@ func originAllowed(origin string, allowed []string) bool {
 	return false
 }
 
-func remoteIP(r *http.Request) string {
-	host, _, err := net.SplitHostPort(r.RemoteAddr)
-	if err == nil {
-		return host
+// PeerIPMiddleware captures the transport peer before RealIP middleware can
+// rewrite RemoteAddr from forwarding headers.
+func PeerIPMiddleware(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		host, _, err := net.SplitHostPort(r.RemoteAddr)
+		if err != nil {
+			host = r.RemoteAddr
+		}
+		ctx := context.WithValue(r.Context(), ContextPeerIP, host)
+		next.ServeHTTP(w, r.WithContext(ctx))
+	})
+}
+
+func (h *SocketHandler) remoteIP(r *http.Request) string {
+	peer, _ := r.Context().Value(ContextPeerIP).(string)
+	if peer == "" {
+		peer, _, _ = net.SplitHostPort(r.RemoteAddr)
+		if peer == "" {
+			peer = r.RemoteAddr
+		}
 	}
-	return r.RemoteAddr
+	peerIP := net.ParseIP(peer)
+	trusted := false
+	for _, network := range h.trustedProxies {
+		if peerIP != nil && network.Contains(peerIP) {
+			trusted = true
+			break
+		}
+	}
+	if trusted {
+		forwarded := strings.TrimSpace(r.Header.Get("X-Real-IP"))
+		if forwarded == "" {
+			forwarded = strings.TrimSpace(strings.Split(r.Header.Get("X-Forwarded-For"), ",")[0])
+		}
+		if parsed := net.ParseIP(forwarded); parsed != nil {
+			return parsed.String()
+		}
+	}
+	if peerIP != nil {
+		return peerIP.String()
+	}
+	return peer
 }
 
 func objectData(value any) map[string]any {

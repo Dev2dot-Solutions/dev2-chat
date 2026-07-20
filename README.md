@@ -160,6 +160,8 @@ proxy_read_timeout 75s;
 Do not log `Sec-WebSocket-Protocol` for `/chat/ws`: it temporarily carries the
 one-use credential. Apply proxy handshake/IP connection limits at or below the
 backend limits for early rejection, but do not strip either offered protocol.
+Set `CHAT_SOCKET_TRUSTED_PROXY_CIDRS` to the proxy's actual source network;
+forwarded client IP headers are ignored from every other peer.
 
 ## POST /agent/ask
 
@@ -219,6 +221,7 @@ backend limits for early rejection, but do not strip either offered protocol.
 | AUTHENTIK_AUDIENCE | — | Required JWT audience |
 | CHAT_ALLOWED_ORIGINS | https://dev2.solutions | REST/SSE CORS origins |
 | CHAT_SOCKET_ALLOWED_ORIGINS | https://dev2.solutions | Exact WebSocket origins (no wildcards) |
+| CHAT_SOCKET_TRUSTED_PROXY_CIDRS | empty | Proxy CIDRs trusted for forwarded client IP |
 | CHAT_SOCKET_SEND_QUEUE | 128 | Per-connection outbound event capacity |
 | CHAT_SOCKET_READ_LIMIT_BYTES | 65536 | Maximum client message size |
 | CHAT_SOCKET_PING_INTERVAL | 25s | WebSocket control-ping interval |

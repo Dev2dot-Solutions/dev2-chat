@@ -33,6 +33,7 @@ const (
 	ContextAuthExpires contextKey = "authExpiresAt"
 	ContextAuthIssued  contextKey = "authIssuedAt"
 	ContextAuthSource  contextKey = "authSource"
+	ContextPeerIP      contextKey = "peerIp"
 )
 
 // jwksCache holds the fetched JWKS keys with a TTL

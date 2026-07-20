@@ -2,6 +2,7 @@ package config
 
 import (
 	"fmt"
+	"net"
 	"os"
 	"strconv"
 	"strings"
@@ -27,6 +28,7 @@ type Config struct {
 	AuthentikAudience          string
 	AllowedOrigins             []string
 	SocketAllowedOrigins       []string
+	SocketTrustedProxyCIDRs    []string
 	SocketSendQueue            int
 	SocketReadLimit            int64
 	SocketPingInterval         time.Duration
@@ -144,6 +146,12 @@ func Load() (*Config, error) {
 	if environment == "development" {
 		defaultOrigins += ",http://localhost:3000"
 	}
+	trustedProxyCIDRs := splitCSV(getEnv("CHAT_SOCKET_TRUSTED_PROXY_CIDRS", ""))
+	for _, cidr := range trustedProxyCIDRs {
+		if _, _, err := net.ParseCIDR(cidr); err != nil {
+			return nil, fmt.Errorf("invalid CHAT_SOCKET_TRUSTED_PROXY_CIDRS entry %q", cidr)
+		}
+	}
 	return &Config{
 		Environment:                environment,
 		Port:                       port,
@@ -162,6 +170,7 @@ func Load() (*Config, error) {
 		AuthentikAudience:          getEnv("AUTHENTIK_AUDIENCE", ""),
 		AllowedOrigins:             splitCSV(getEnv("CHAT_ALLOWED_ORIGINS", defaultOrigins)),
 		SocketAllowedOrigins:       splitCSV(getEnv("CHAT_SOCKET_ALLOWED_ORIGINS", defaultOrigins)),
+		SocketTrustedProxyCIDRs:    trustedProxyCIDRs,
 		SocketSendQueue:            sendQueue,
 		SocketReadLimit:            int64(readLimit),
 		SocketPingInterval:         pingInterval,

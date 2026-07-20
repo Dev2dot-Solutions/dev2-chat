@@ -629,3 +629,25 @@ func TestOriginPolicyRequiresExactConfiguredOrigin(t *testing.T) {
 		t.Fatal("configured origin rejected")
 	}
 }
+
+func TestForwardedIPRequiresTrustedProxyPeer(t *testing.T) {
+	request := httptest.NewRequest(http.MethodGet, "/chat/ws", nil)
+	request.RemoteAddr = "203.0.113.10:12345"
+	request.Header.Set("X-Real-IP", "198.51.100.20")
+
+	var untrustedIP string
+	PeerIPMiddleware(http.HandlerFunc(func(_ http.ResponseWriter, r *http.Request) {
+		untrustedIP = NewSocketHandler(nil, nil, nil, SocketOptions{}).remoteIP(r)
+	})).ServeHTTP(httptest.NewRecorder(), request)
+	if untrustedIP != "203.0.113.10" {
+		t.Fatalf("untrusted peer spoofed client IP: %q", untrustedIP)
+	}
+
+	var trustedIP string
+	PeerIPMiddleware(http.HandlerFunc(func(_ http.ResponseWriter, r *http.Request) {
+		trustedIP = NewSocketHandler(nil, nil, nil, SocketOptions{TrustedProxyCIDRs: []string{"203.0.113.0/24"}}).remoteIP(r)
+	})).ServeHTTP(httptest.NewRecorder(), request)
+	if trustedIP != "198.51.100.20" {
+		t.Fatalf("trusted proxy IP was not used: %q", trustedIP)
+	}
+}

@@ -121,7 +121,8 @@ func main() {
 	)
 	settingsHandler := handlers.NewSettingsHandler(settingsRepo)
 	socketHandler := handlers.NewSocketHandler(socketRepo, agentHandler, chatHandler, handlers.SocketOptions{
-		AllowedOrigins: cfg.SocketAllowedOrigins, SendQueue: cfg.SocketSendQueue, ReadLimit: cfg.SocketReadLimit,
+		AllowedOrigins: cfg.SocketAllowedOrigins, TrustedProxyCIDRs: cfg.SocketTrustedProxyCIDRs,
+		SendQueue: cfg.SocketSendQueue, ReadLimit: cfg.SocketReadLimit,
 		PingInterval: cfg.SocketPingInterval, IdleTimeout: cfg.SocketIdleTimeout,
 		MaxLifetime: cfg.SocketMaxLifetime, DeveloperMaxLifetime: cfg.SocketDeveloperMaxLifetime,
 		ServiceMaxLifetime: cfg.SocketServiceMaxLifetime,
@@ -139,6 +140,7 @@ func main() {
 	// Router
 	r := chi.NewRouter()
 	r.Use(chimw.RequestID)
+	r.Use(handlers.PeerIPMiddleware)
 	r.Use(chimw.RealIP)
 	r.Use(chimw.Logger)
 	r.Use(chimw.Recoverer)
