@@ -127,7 +127,8 @@ func main() {
 	settingsHandler := handlers.NewSettingsHandler(settingsRepo)
 	socketHandler := handlers.NewSocketHandler(socketRepo, agentHandler, chatHandler, handlers.SocketOptions{
 		AllowedOrigins: cfg.SocketAllowedOrigins, TrustedProxyCIDRs: cfg.SocketTrustedProxyCIDRs,
-		SendQueue: cfg.SocketSendQueue, ReadLimit: cfg.SocketReadLimit,
+		RequireTrustedProxy: cfg.SocketRequireTrustedProxy,
+		SendQueue:           cfg.SocketSendQueue, ReadLimit: cfg.SocketReadLimit,
 		PingInterval: cfg.SocketPingInterval, IdleTimeout: cfg.SocketIdleTimeout,
 		MaxLifetime: cfg.SocketMaxLifetime, DeveloperMaxLifetime: cfg.SocketDeveloperMaxLifetime,
 		ServiceMaxLifetime: cfg.SocketServiceMaxLifetime,
@@ -137,7 +138,8 @@ func main() {
 			UserLimit: cfg.SocketConnectionsUser, IPLimit: cfg.SocketConnectionsIP, LeaseTTL: cfg.SocketConnectionLeaseTTL,
 		},
 		GenerationPolicy: repository.GenerationPolicy{
-			CompanyLimit: cfg.SocketGenerationsCompany, UserLimit: cfg.SocketGenerationsUser, LeaseTTL: cfg.SocketGenerationLeaseTTL,
+			GlobalLimit: cfg.SocketGenerationsGlobal, CompanyLimit: cfg.SocketGenerationsCompany,
+			UserLimit: cfg.SocketGenerationsUser, LeaseTTL: cfg.SocketGenerationLeaseTTL,
 		},
 		MessagesPerMinute: cfg.SocketMessagesPerMinute, MessageBurst: cfg.SocketMessageBurst,
 		MessageRatePolicy: repository.MessageRatePolicy{

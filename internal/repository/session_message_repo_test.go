@@ -57,12 +57,11 @@ func TestListBySessionQueriesLatestThenReturnsChronological(t *testing.T) {
 }
 
 func TestClientSessionListIncludesLegacyProfilesWithoutDeveloper(t *testing.T) {
-	filter := buildSessionListFilter("company", "user", "client", false)
-	alternatives, ok := filter["$or"].(bson.A)
-	if !ok || len(alternatives) != 3 {
-		t.Fatalf("client legacy profile alternatives missing: %#v", filter)
-	}
+	filter := buildSessionListFilter("company", "user", "client", []string{"visible-project"}, nil)
 	encoded, _ := bson.MarshalExtJSON(filter, false, false)
+	if !strings.Contains(string(encoded), `"accessProfile":""`) || !strings.Contains(string(encoded), `"$exists":false`) {
+		t.Fatalf("client legacy profile alternatives missing: %s", encoded)
+	}
 	if strings.Contains(string(encoded), `"developer"`) {
 		t.Fatalf("client filter exposes developer sessions: %s", encoded)
 	}

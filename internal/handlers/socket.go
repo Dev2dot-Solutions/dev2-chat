@@ -51,6 +51,7 @@ type socketStore interface {
 type SocketOptions struct {
 	AllowedOrigins       []string
 	TrustedProxyCIDRs    []string
+	RequireTrustedProxy  bool
 	SendQueue            int
 	ReadLimit            int64
 	PingInterval         time.Duration
@@ -146,6 +147,9 @@ func applySocketDefaults(options *SocketOptions) {
 	}
 	if options.GenerationPolicy.CompanyLimit <= 0 {
 		options.GenerationPolicy.CompanyLimit = 20
+	}
+	if options.GenerationPolicy.GlobalLimit <= 0 {
+		options.GenerationPolicy.GlobalLimit = 100
 	}
 	if options.GenerationPolicy.UserLimit <= 0 {
 		options.GenerationPolicy.UserLimit = 2
@@ -253,6 +257,10 @@ func (h *SocketHandler) IssueTicket(w http.ResponseWriter, r *http.Request) {
 }
 
 func (h *SocketHandler) Connect(w http.ResponseWriter, r *http.Request) {
+	if h.options.RequireTrustedProxy && !h.isTrustedPeer(r) {
+		respondError(w, http.StatusForbidden, "WebSocket connections require a trusted proxy")
+		return
+	}
 	if r.URL.Query().Has("ticket") {
 		respondError(w, http.StatusBadRequest, "query tickets are not supported")
 		return
@@ -1019,13 +1027,7 @@ func PeerIPMiddleware(next http.Handler) http.Handler {
 }
 
 func (h *SocketHandler) remoteIP(r *http.Request) string {
-	peer, _ := r.Context().Value(ContextPeerIP).(string)
-	if peer == "" {
-		peer, _, _ = net.SplitHostPort(r.RemoteAddr)
-		if peer == "" {
-			peer = r.RemoteAddr
-		}
-	}
+	peer := peerIP(r)
 	peerIP := net.ParseIP(peer)
 	trusted := false
 	for _, network := range h.trustedProxies {
@@ -1045,6 +1047,31 @@ func (h *SocketHandler) remoteIP(r *http.Request) string {
 	}
 	if peerIP != nil {
 		return peerIP.String()
+	}
+	return peer
+}
+
+func (h *SocketHandler) isTrustedPeer(r *http.Request) bool {
+	peer := net.ParseIP(peerIP(r))
+	if peer == nil {
+		return false
+	}
+	for _, network := range h.trustedProxies {
+		if network.Contains(peer) {
+			return true
+		}
+	}
+	return false
+}
+
+func peerIP(r *http.Request) string {
+	peer, _ := r.Context().Value(ContextPeerIP).(string)
+	if peer != "" {
+		return peer
+	}
+	peer, _, _ = net.SplitHostPort(r.RemoteAddr)
+	if peer == "" {
+		peer = r.RemoteAddr
 	}
 	return peer
 }

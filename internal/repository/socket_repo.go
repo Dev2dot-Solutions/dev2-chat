@@ -48,6 +48,7 @@ type ConnectionPolicy struct {
 }
 
 type GenerationPolicy struct {
+	GlobalLimit  int
 	CompanyLimit int
 	UserLimit    int
 	LeaseTTL     time.Duration
@@ -206,6 +207,7 @@ func (r *SocketRepo) AcquireGeneration(ctx context.Context, identity models.Sock
 		key   string
 		limit int
 	}{
+		{"generation:global", policy.GlobalLimit},
 		{"generation:company:" + identity.CompanyID, policy.CompanyLimit},
 		{"generation:user:" + identity.CompanyID + ":" + identity.UserID, policy.UserLimit},
 	}

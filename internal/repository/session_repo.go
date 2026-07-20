@@ -98,12 +98,11 @@ func (r *SessionRepo) BindLegacyProject(ctx context.Context, id, companyID, user
 	return &session, nil
 }
 
-// ListByCompany lists sessions for a company. accessProfile, when non-empty,
-// filters to sessions of that exact profile; excludeDeveloper (used for
-// non-admin listing without an explicit profile filter) hides developer
-// sessions while keeping legacy (untagged) sessions visible.
-func (r *SessionRepo) ListByCompany(ctx context.Context, companyID, userID, accessProfile string, excludeDeveloper bool, limit, offset int) (*models.SessionListResponse, error) {
-	filter := buildSessionListFilter(companyID, userID, accessProfile, excludeDeveloper)
+// ListByCompany lists sessions within pre-authorized project sets. Client
+// filtering keeps unbound legacy sessions visible for first-send binding;
+// project-bound sessions must match the current profile visibility snapshot.
+func (r *SessionRepo) ListByCompany(ctx context.Context, companyID, userID, accessProfile string, clientProjectIDs, developerProjectIDs []string, limit, offset int) (*models.SessionListResponse, error) {
+	filter := buildSessionListFilter(companyID, userID, accessProfile, clientProjectIDs, developerProjectIDs)
 
 	total, err := r.coll.CountDocuments(ctx, filter)
 	if err != nil {
@@ -145,22 +144,32 @@ func (r *SessionRepo) ListByCompany(ctx context.Context, companyID, userID, acce
 	return &models.SessionListResponse{Sessions: items, Total: int(total)}, nil
 }
 
-func buildSessionListFilter(companyID, userID, accessProfile string, excludeDeveloper bool) bson.M {
+func buildSessionListFilter(companyID, userID, accessProfile string, clientProjectIDs, developerProjectIDs []string) bson.M {
 	filter := bson.M{"companyId": companyID}
 	if userID != "" {
 		filter["userId"] = userID
 	}
+	clientProfile := bson.M{"$or": bson.A{
+		bson.M{"accessProfile": models.AccessProfileClient},
+		bson.M{"accessProfile": ""},
+		bson.M{"accessProfile": bson.M{"$exists": false}},
+	}}
+	clientProject := bson.M{"$or": bson.A{
+		bson.M{"projectId": bson.M{"$in": clientProjectIDs}},
+		bson.M{"projectId": ""},
+		bson.M{"projectId": bson.M{"$exists": false}},
+	}}
+	clientCondition := bson.M{"$and": bson.A{clientProfile, clientProject}}
+	developerCondition := bson.M{"accessProfile": models.AccessProfileDeveloper, "projectId": bson.M{"$in": developerProjectIDs}}
 	switch {
 	case accessProfile == models.AccessProfileClient:
-		filter["$or"] = bson.A{
-			bson.M{"accessProfile": models.AccessProfileClient},
-			bson.M{"accessProfile": ""},
-			bson.M{"accessProfile": bson.M{"$exists": false}},
+		filter["$and"] = clientCondition["$and"]
+	case accessProfile == models.AccessProfileDeveloper:
+		for key, value := range developerCondition {
+			filter[key] = value
 		}
-	case accessProfile != "":
-		filter["accessProfile"] = accessProfile
-	case excludeDeveloper:
-		filter["accessProfile"] = bson.M{"$ne": models.AccessProfileDeveloper}
+	default:
+		filter["$or"] = bson.A{clientCondition, developerCondition}
 	}
 	return filter
 }

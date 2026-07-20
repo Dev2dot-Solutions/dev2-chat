@@ -46,6 +46,7 @@ type Config struct {
 	SocketConnectionsIP        int
 	SocketConnectionLeaseTTL   time.Duration
 	SocketGenerationsCompany   int
+	SocketGenerationsGlobal    int
 	SocketGenerationsUser      int
 	SocketGenerationLeaseTTL   time.Duration
 	SocketMessagesPerMinute    int
@@ -148,6 +149,10 @@ func Load() (*Config, error) {
 	if err != nil {
 		return nil, err
 	}
+	genGlobal, err := intValue("CHAT_SOCKET_GENERATIONS_GLOBAL", 100)
+	if err != nil {
+		return nil, err
+	}
 	genUser, err := intValue("CHAT_SOCKET_GENERATIONS_PER_USER", 2)
 	if err != nil {
 		return nil, err
@@ -229,6 +234,7 @@ func Load() (*Config, error) {
 		SocketConnectionsIP:        connIP,
 		SocketConnectionLeaseTTL:   connectionLeaseTTL,
 		SocketGenerationsCompany:   genCompany,
+		SocketGenerationsGlobal:    genGlobal,
 		SocketGenerationsUser:      genUser,
 		SocketGenerationLeaseTTL:   generationLeaseTTL,
 		SocketMessagesPerMinute:    messagesMinute,

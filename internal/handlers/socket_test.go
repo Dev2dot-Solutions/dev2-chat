@@ -658,6 +658,37 @@ func TestForwardedIPRequiresTrustedProxyPeer(t *testing.T) {
 	}
 }
 
+func TestRequiredTrustedProxyRejectsDirectPeerAndAcceptsTrustedPeer(t *testing.T) {
+	store := newMemorySocketStore()
+	handler := NewSocketHandler(store, nil, nil, SocketOptions{
+		AllowedOrigins: []string{"https://dev2.solutions"}, TrustedProxyCIDRs: []string{"127.0.0.1/32"}, RequireTrustedProxy: true,
+	})
+	untrusted := httptest.NewRequest(http.MethodGet, "/chat/ws", nil)
+	untrusted.RemoteAddr = "192.0.2.50:1234"
+	untrusted.Header.Set("Origin", "https://dev2.solutions")
+	response := httptest.NewRecorder()
+	handler.Connect(response, untrusted)
+	if response.Code != http.StatusForbidden || store.consumeCalls != 0 {
+		t.Fatalf("untrusted direct peer reached handshake storage: status=%d consumes=%d", response.Code, store.consumeCalls)
+	}
+
+	now := time.Now()
+	identity := models.SocketIdentity{UserID: "u", CompanyID: "c", AccessProfile: "client", ProjectID: "p", AuthExpiresAt: now.Add(time.Hour)}
+	token, _, _ := store.IssueTicket(context.Background(), identity, now.Add(time.Hour), repository.TicketPolicy{}, now)
+	server := httptest.NewServer(PeerIPMiddleware(http.HandlerFunc(handler.Connect)))
+	defer server.Close()
+	dialer := websocket.Dialer{Subprotocols: []string{baseProtocol, ticketProtocolPrefix + token}}
+	conn, _, err := dialer.Dial("ws"+strings.TrimPrefix(server.URL, "http")+"/chat/ws", http.Header{"Origin": []string{"https://dev2.solutions"}})
+	if err != nil {
+		t.Fatalf("trusted proxy peer was rejected: %v", err)
+	}
+	defer conn.Close()
+	var ready models.SocketServerEvent
+	if err := conn.ReadJSON(&ready); err != nil || ready.Type != "connection.ready" {
+		t.Fatalf("trusted proxy connection not ready: %#v err=%v", ready, err)
+	}
+}
+
 func TestEphemeralErrorsUseZeroSequence(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	connection := &socketConnection{ctx: ctx, cancel: cancel, send: make(chan models.SocketServerEvent, 1), generations: make(map[string]context.CancelFunc)}

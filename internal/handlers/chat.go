@@ -20,6 +20,7 @@ type ChatHandler struct {
 	natsClient            *nats.Client
 	legacyActiveTransport bool
 	agentHandler          *AgentHandler
+	projectResolver       func(string) ([]models.CompanyProject, error)
 }
 
 func (h *ChatHandler) SetLegacyActiveTransportEnabled(enabled bool) {
@@ -28,6 +29,9 @@ func (h *ChatHandler) SetLegacyActiveTransportEnabled(enabled bool) {
 
 func (h *ChatHandler) SetAgentHandler(agent *AgentHandler) {
 	h.agentHandler = agent
+	if agent != nil && agent.natsClient != nil {
+		h.projectResolver = agent.natsClient.RequestCompanyProjectsFresh
+	}
 }
 
 func NewChatHandler(sr *repository.SessionRepo, mr *repository.MessageRepo, ar *repository.ApprovalRepo, nc *nats.Client) *ChatHandler {
@@ -57,42 +61,49 @@ func (h *ChatHandler) SendMessage(w http.ResponseWriter, r *http.Request) {
 }
 
 // ListSessions handles GET /chat/sessions
-// Query params: companyId (required), userId, accessProfile (client|developer),
-// limit, offset. Non-admin callers are restricted to their own sessions and
-// can never see developer-profile sessions.
+// Admins deliberately choose companyId/userId/profile query scope. Non-admin
+// scope always comes from authenticated context and never from query input.
 func (h *ChatHandler) ListSessions(w http.ResponseWriter, r *http.Request) {
-	companyID := r.URL.Query().Get("companyId")
-	if !isValidUUID(companyID) {
-		respondError(w, http.StatusBadRequest, "missing or invalid companyId")
-		return
-	}
-	userID := r.URL.Query().Get("userId")
+	isAdmin := GetIsAdmin(r)
+	requestedCompanyID := r.URL.Query().Get("companyId")
+	companyID, userID := requestedCompanyID, r.URL.Query().Get("userId")
 	accessProfile := r.URL.Query().Get("accessProfile")
 	if accessProfile != "" && !models.IsValidAccessProfile(accessProfile) {
 		respondError(w, http.StatusBadRequest, "accessProfile must be \"client\" or \"developer\"")
 		return
 	}
-	excludeDeveloper := false
-	if !GetIsAdmin(r) {
+	if !isAdmin {
+		companyID, userID = GetCompanyID(r), GetUserID(r)
+		if !isValidUUID(companyID) || userID == "" {
+			respondError(w, http.StatusForbidden, "authenticated company and user identity are required")
+			return
+		}
+		if requestedCompanyID != "" && requestedCompanyID != companyID {
+			respondError(w, http.StatusForbidden, "company query scope does not match authenticated company")
+			return
+		}
 		if accessProfile == models.AccessProfileDeveloper {
 			respondError(w, http.StatusForbidden, "developer sessions require an admin user")
 			return
 		}
-		// Non-admins only ever list their own sessions, and developer
-		// sessions are hidden unless explicitly filtered (admin-only above).
-		userID = GetUserID(r)
-		if userID == "" {
-			respondError(w, http.StatusForbidden, "user identity unavailable")
-			return
-		}
 		if accessProfile == "" {
-			excludeDeveloper = true
+			accessProfile = models.AccessProfileClient
 		}
+	} else if !isValidUUID(companyID) {
+		respondError(w, http.StatusBadRequest, "missing or invalid companyId")
+		return
 	}
+	projects, err := h.resolveHistoryProjects(companyID)
+	if err != nil {
+		log.Printf("[chat] project authorization unavailable for session list: %v", err)
+		respondError(w, http.StatusServiceUnavailable, "project authorization unavailable")
+		return
+	}
+	clientProjectIDs, developerProjectIDs := visibleProjectIDs(projects, companyID)
 	limit, _ := strconv.Atoi(r.URL.Query().Get("limit"))
 	offset, _ := strconv.Atoi(r.URL.Query().Get("offset"))
 
-	result, err := h.sessionRepo.ListByCompany(r.Context(), companyID, userID, accessProfile, excludeDeveloper, limit, offset)
+	result, err := h.sessionRepo.ListByCompany(r.Context(), companyID, userID, accessProfile, clientProjectIDs, developerProjectIDs, limit, offset)
 	if err != nil {
 		log.Printf("[chat] ListSessions error: %v", err)
 		respondError(w, http.StatusInternalServerError, "failed to list sessions")
@@ -122,17 +133,20 @@ func (h *ChatHandler) GetSession(w http.ResponseWriter, r *http.Request) {
 	}
 
 	if !GetIsAdmin(r) {
-		// Non-admins: developer sessions are admin-only, and client sessions
-		// are readable only by their owner — which also blocks reading
-		// another company's sessions.
-		if models.NormalizeAccessProfile(session.AccessProfile) == models.AccessProfileDeveloper {
-			respondError(w, http.StatusForbidden, "developer sessions require an admin user")
+		if errMsg := nonAdminHistoryAuthorizationError(session, GetCompanyID(r), GetUserID(r)); errMsg != "" {
+			respondError(w, http.StatusForbidden, errMsg)
 			return
 		}
-		if uid := GetUserID(r); uid == "" || session.UserID == "" || session.UserID != uid {
-			respondError(w, http.StatusForbidden, "session belongs to a different user")
-			return
-		}
+	}
+	projects, err := h.resolveHistoryProjects(session.CompanyID)
+	if err != nil {
+		log.Printf("[chat] project authorization unavailable for session %s: %v", id, err)
+		respondError(w, http.StatusServiceUnavailable, "project authorization unavailable")
+		return
+	}
+	if !historySessionVisible(session, projects) {
+		respondError(w, http.StatusForbidden, "session project access revoked")
+		return
 	}
 
 	messages, err := h.messageRepo.ListBySession(r.Context(), id, 50)
@@ -149,6 +163,59 @@ func (h *ChatHandler) GetSession(w http.ResponseWriter, r *http.Request) {
 		"session":  session,
 		"messages": messages,
 	})
+}
+
+func nonAdminHistoryAuthorizationError(session *models.ChatSession, companyID, userID string) string {
+	if session == nil || companyID == "" || session.CompanyID != companyID {
+		return "session belongs to a different company"
+	}
+	if models.NormalizeAccessProfile(session.AccessProfile) == models.AccessProfileDeveloper {
+		return "developer sessions require an admin user"
+	}
+	if userID == "" || session.UserID == "" || session.UserID != userID {
+		return "session belongs to a different user"
+	}
+	return ""
+}
+
+func (h *ChatHandler) resolveHistoryProjects(companyID string) ([]models.CompanyProject, error) {
+	if h.projectResolver == nil {
+		return nil, fmt.Errorf("project resolver unavailable")
+	}
+	return h.projectResolver(companyID)
+}
+
+func visibleProjectIDs(projects []models.CompanyProject, companyID string) ([]string, []string) {
+	var clientIDs, developerIDs []string
+	for _, project := range projects {
+		if project.CompanyID != "" && project.CompanyID != companyID {
+			continue
+		}
+		if project.Visibility.Client {
+			clientIDs = append(clientIDs, project.ID)
+		}
+		if project.Visibility.Developer {
+			developerIDs = append(developerIDs, project.ID)
+		}
+	}
+	return clientIDs, developerIDs
+}
+
+func historySessionVisible(session *models.ChatSession, projects []models.CompanyProject) bool {
+	profile := models.NormalizeAccessProfile(session.AccessProfile)
+	if session.ProjectID == "" {
+		return profile == models.AccessProfileClient
+	}
+	for _, project := range projects {
+		if project.ID != session.ProjectID || (project.CompanyID != "" && project.CompanyID != session.CompanyID) {
+			continue
+		}
+		if profile == models.AccessProfileDeveloper {
+			return project.Visibility.Developer
+		}
+		return project.Visibility.Client
+	}
+	return false
 }
 
 func stripActionableApprovals(messages []models.ChatMessage) {

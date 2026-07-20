@@ -39,6 +39,12 @@ decisions are disabled with `410 Gone` by default in production. Set
 configuration rejects attempts to enable it. Durable session/history APIs
 remain REST endpoints.
 
+Session/history authorization is also live: non-admin list scope always comes
+from authenticated company/user claims, and both list/detail endpoints filter
+against a fresh project-visibility snapshot. Admins deliberately retain
+cross-company history access by supplying `companyId`, but revoked projects
+remain hidden for admins too.
+
 ## WebSocket chat
 
 1. With the normal JWT, call `POST /chat/socket-ticket`:
@@ -185,7 +191,10 @@ backend limits for early rejection, but do not strip either offered protocol.
 Set `CHAT_SOCKET_TRUSTED_PROXY_CIDRS` to only the proxy's actual source
 host/network; forwarded client IP headers are ignored from every other peer.
 Production startup fails when `CHAT_SOCKET_REQUIRE_TRUSTED_PROXY=true` and this
-list is empty. Do not substitute a broad private-network CIDR.
+list is empty. The WebSocket handler also rejects any connection whose actual
+transport peer is outside those CIDRs. Do not substitute a broad
+private-network CIDR. The tracked Compose port is loopback-only
+(`127.0.0.1:8085:8080`).
 
 ## POST /agent/ask
 
@@ -263,6 +272,7 @@ list is empty. Do not substitute a broad private-network CIDR.
 | CHAT_SOCKET_CONNECTIONS_PER_IP | 20 | IP active connection leases |
 | CHAT_SOCKET_CONNECTION_LEASE_TTL | 75s | Crash-recovery connection lease TTL |
 | CHAT_SOCKET_GENERATIONS_PER_COMPANY | 20 | Company active generations |
+| CHAT_SOCKET_GENERATIONS_GLOBAL | 100 | Service-wide active generation leases |
 | CHAT_SOCKET_GENERATIONS_PER_USER | 2 | User active generations |
 | CHAT_SOCKET_GENERATION_LEASE_TTL | 3m | Crash-recovery generation lease TTL |
 | CHAT_SOCKET_MESSAGES_PER_MINUTE | 60 | Per-socket frame refill rate |

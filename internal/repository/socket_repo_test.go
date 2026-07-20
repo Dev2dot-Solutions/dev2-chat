@@ -75,6 +75,28 @@ func TestMongoBackedRateAndLeaseCapacity(t *testing.T) {
 			mt.Fatalf("connection capacity not enforced: %v", err)
 		}
 	})
+	mt.Run("global generation lease", func(mt *mtest.T) {
+		repo := &SocketRepo{leases: mt.Coll}
+		for i := 0; i < 3; i++ {
+			mt.AddMockResponses(mtest.CreateSuccessResponse(bson.E{Key: "value", Value: bson.D{{Key: "connectionId", Value: "generation"}}}))
+		}
+		lease, err := repo.AcquireGeneration(context.Background(), models.SocketIdentity{CompanyID: "c", UserID: "u"}, GenerationPolicy{
+			GlobalLimit: 1, CompanyLimit: 1, UserLimit: 1, LeaseTTL: time.Minute,
+		}, time.Now())
+		if err != nil || len(lease.LeaseIDs) != 3 {
+			mt.Fatalf("global/company/user generation lease missing: %#v err=%v", lease, err)
+		}
+	})
+	mt.Run("global generation capacity", func(mt *mtest.T) {
+		repo := &SocketRepo{leases: mt.Coll}
+		mt.AddMockResponses(mtest.CreateCommandErrorResponse(mtest.CommandError{Code: 11000, Message: "duplicate"}))
+		_, err := repo.AcquireGeneration(context.Background(), models.SocketIdentity{CompanyID: "c", UserID: "u"}, GenerationPolicy{
+			GlobalLimit: 1, CompanyLimit: 2, UserLimit: 2, LeaseTTL: time.Minute,
+		}, time.Now())
+		if !errors.Is(err, ErrSocketCapacity) {
+			mt.Fatalf("global generation capacity not enforced: %v", err)
+		}
+	})
 	mt.Run("outstanding ticket slots", func(mt *mtest.T) {
 		repo := &SocketRepo{tickets: mt.Coll, ticketSlots: mt.Coll, rateBuckets: mt.Coll}
 		now := time.Now()

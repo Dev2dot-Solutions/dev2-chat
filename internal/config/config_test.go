@@ -55,8 +55,12 @@ func TestProductionRequiresNarrowTrustedProxyConfiguration(t *testing.T) {
 		t.Fatal("production proxy requirement allowed an empty trusted CIDR list")
 	}
 	t.Setenv("CHAT_SOCKET_TRUSTED_PROXY_CIDRS", "192.0.2.10/32")
-	if _, err := Load(); err != nil {
+	cfg, err := Load()
+	if err != nil {
 		t.Fatalf("narrow trusted proxy CIDR rejected: %v", err)
+	}
+	if cfg.SocketGenerationsGlobal != 100 {
+		t.Fatalf("unexpected global generation default: %d", cfg.SocketGenerationsGlobal)
 	}
 }
 
