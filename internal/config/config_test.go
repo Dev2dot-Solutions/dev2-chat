@@ -9,6 +9,7 @@ func TestProductionOriginsExcludeLocalhostAndRESTIsSeparate(t *testing.T) {
 	t.Setenv("ENVIRONMENT", "production")
 	t.Setenv("CHAT_ALLOWED_ORIGINS", "https://rest.example")
 	t.Setenv("CHAT_SOCKET_ALLOWED_ORIGINS", "https://socket.example")
+	t.Setenv("CHAT_SOCKET_REQUIRE_TRUSTED_PROXY", "false")
 	cfg, err := Load()
 	if err != nil {
 		t.Fatal(err)
@@ -25,6 +26,7 @@ func TestLocalhostDefaultRequiresDevelopmentEnvironment(t *testing.T) {
 			t.Setenv("ENVIRONMENT", environment)
 			t.Setenv("CHAT_ALLOWED_ORIGINS", "")
 			t.Setenv("CHAT_SOCKET_ALLOWED_ORIGINS", "")
+			t.Setenv("CHAT_SOCKET_REQUIRE_TRUSTED_PROXY", "false")
 			cfg, err := Load()
 			if err != nil {
 				t.Fatal(err)
@@ -38,8 +40,51 @@ func TestLocalhostDefaultRequiresDevelopmentEnvironment(t *testing.T) {
 }
 
 func TestTrustedProxyCIDRsAreValidated(t *testing.T) {
+	t.Setenv("CHAT_SOCKET_REQUIRE_TRUSTED_PROXY", "false")
 	t.Setenv("CHAT_SOCKET_TRUSTED_PROXY_CIDRS", "not-a-cidr")
 	if _, err := Load(); err == nil {
 		t.Fatal("invalid trusted proxy CIDR accepted")
+	}
+}
+
+func TestProductionRequiresNarrowTrustedProxyConfiguration(t *testing.T) {
+	t.Setenv("ENVIRONMENT", "production")
+	t.Setenv("CHAT_SOCKET_REQUIRE_TRUSTED_PROXY", "true")
+	t.Setenv("CHAT_SOCKET_TRUSTED_PROXY_CIDRS", "")
+	if _, err := Load(); err == nil {
+		t.Fatal("production proxy requirement allowed an empty trusted CIDR list")
+	}
+	t.Setenv("CHAT_SOCKET_TRUSTED_PROXY_CIDRS", "192.0.2.10/32")
+	if _, err := Load(); err != nil {
+		t.Fatalf("narrow trusted proxy CIDR rejected: %v", err)
+	}
+}
+
+func TestLegacyTransportDefaultsOffOutsideDevelopment(t *testing.T) {
+	for _, test := range []struct {
+		environment string
+		enabled     bool
+	}{{"production", false}, {"development", true}} {
+		t.Run(test.environment, func(t *testing.T) {
+			t.Setenv("ENVIRONMENT", test.environment)
+			t.Setenv("CHAT_SOCKET_REQUIRE_TRUSTED_PROXY", "false")
+			t.Setenv("CHAT_LEGACY_ACTIVE_TRANSPORT_ENABLED", "")
+			cfg, err := Load()
+			if err != nil {
+				t.Fatal(err)
+			}
+			if cfg.LegacyActiveTransport != test.enabled {
+				t.Fatalf("legacy transport enabled=%v", cfg.LegacyActiveTransport)
+			}
+		})
+	}
+}
+
+func TestProductionCannotEnableLegacyActiveTransport(t *testing.T) {
+	t.Setenv("ENVIRONMENT", "production")
+	t.Setenv("CHAT_LEGACY_ACTIVE_TRANSPORT_ENABLED", "true")
+	t.Setenv("CHAT_SOCKET_REQUIRE_TRUSTED_PROXY", "false")
+	if _, err := Load(); err == nil {
+		t.Fatal("production enabled the legacy active transport")
 	}
 }

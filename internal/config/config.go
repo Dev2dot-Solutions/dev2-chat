@@ -12,6 +12,7 @@ import (
 // Config holds all configuration for dev2-chat.
 type Config struct {
 	Environment                string
+	LegacyActiveTransport      bool
 	Port                       int
 	MongoURI                   string
 	MongoDatabase              string
@@ -29,6 +30,7 @@ type Config struct {
 	AllowedOrigins             []string
 	SocketAllowedOrigins       []string
 	SocketTrustedProxyCIDRs    []string
+	SocketRequireTrustedProxy  bool
 	SocketSendQueue            int
 	SocketReadLimit            int64
 	SocketPingInterval         time.Duration
@@ -48,9 +50,26 @@ type Config struct {
 	SocketGenerationLeaseTTL   time.Duration
 	SocketMessagesPerMinute    int
 	SocketMessageBurst         int
+	SocketMessagesUser         int
+	SocketMessagesCompany      int
+	SocketMessagesIP           int
+	SocketHandshakeRate        int
+	SocketHandshakeBurst       int
 }
 
 func Load() (*Config, error) {
+	environment := strings.ToLower(getEnv("ENVIRONMENT", "production"))
+	legacyTransport, err := getEnvBool("CHAT_LEGACY_ACTIVE_TRANSPORT_ENABLED", environment == "development")
+	if err != nil {
+		return nil, err
+	}
+	if environment == "production" && legacyTransport {
+		return nil, fmt.Errorf("CHAT_LEGACY_ACTIVE_TRANSPORT_ENABLED cannot be enabled in production")
+	}
+	requireTrustedProxy, err := getEnvBool("CHAT_SOCKET_REQUIRE_TRUSTED_PROXY", environment == "production")
+	if err != nil {
+		return nil, err
+	}
 	port, err := getEnvInt("PORT", 8080)
 	if err != nil {
 		return nil, fmt.Errorf("PORT: %w", err)
@@ -141,7 +160,26 @@ func Load() (*Config, error) {
 	if err != nil {
 		return nil, err
 	}
-	environment := strings.ToLower(getEnv("ENVIRONMENT", "production"))
+	messageUser, err := intValue("CHAT_SOCKET_MESSAGES_PER_MINUTE_PER_USER", 120)
+	if err != nil {
+		return nil, err
+	}
+	messageCompany, err := intValue("CHAT_SOCKET_MESSAGES_PER_MINUTE_PER_COMPANY", 1200)
+	if err != nil {
+		return nil, err
+	}
+	messageIP, err := intValue("CHAT_SOCKET_MESSAGES_PER_MINUTE_PER_IP", 600)
+	if err != nil {
+		return nil, err
+	}
+	handshakeRate, err := intValue("CHAT_SOCKET_HANDSHAKE_RATE_PER_MINUTE", 30)
+	if err != nil {
+		return nil, err
+	}
+	handshakeBurst, err := intValue("CHAT_SOCKET_HANDSHAKE_BURST", 10)
+	if err != nil {
+		return nil, err
+	}
 	defaultOrigins := "https://dev2.solutions"
 	if environment == "development" {
 		defaultOrigins += ",http://localhost:3000"
@@ -152,8 +190,12 @@ func Load() (*Config, error) {
 			return nil, fmt.Errorf("invalid CHAT_SOCKET_TRUSTED_PROXY_CIDRS entry %q", cidr)
 		}
 	}
+	if requireTrustedProxy && len(trustedProxyCIDRs) == 0 {
+		return nil, fmt.Errorf("CHAT_SOCKET_TRUSTED_PROXY_CIDRS is required when CHAT_SOCKET_REQUIRE_TRUSTED_PROXY=true")
+	}
 	return &Config{
 		Environment:                environment,
+		LegacyActiveTransport:      legacyTransport,
 		Port:                       port,
 		MongoURI:                   getEnv("MONGO_URI", "mongodb://root:dev2@mongodb:27017/dev2knowledge?authSource=admin"),
 		MongoDatabase:              getEnv("MONGO_DATABASE", "dev2knowledge"),
@@ -171,6 +213,7 @@ func Load() (*Config, error) {
 		AllowedOrigins:             splitCSV(getEnv("CHAT_ALLOWED_ORIGINS", defaultOrigins)),
 		SocketAllowedOrigins:       splitCSV(getEnv("CHAT_SOCKET_ALLOWED_ORIGINS", defaultOrigins)),
 		SocketTrustedProxyCIDRs:    trustedProxyCIDRs,
+		SocketRequireTrustedProxy:  requireTrustedProxy,
 		SocketSendQueue:            sendQueue,
 		SocketReadLimit:            int64(readLimit),
 		SocketPingInterval:         pingInterval,
@@ -190,6 +233,11 @@ func Load() (*Config, error) {
 		SocketGenerationLeaseTTL:   generationLeaseTTL,
 		SocketMessagesPerMinute:    messagesMinute,
 		SocketMessageBurst:         messageBurst,
+		SocketMessagesUser:         messageUser,
+		SocketMessagesCompany:      messageCompany,
+		SocketMessagesIP:           messageIP,
+		SocketHandshakeRate:        handshakeRate,
+		SocketHandshakeBurst:       handshakeBurst,
 	}, nil
 }
 
@@ -233,4 +281,16 @@ func getEnvInt(key string, fallback int) (int, error) {
 		return 0, fmt.Errorf("invalid %s: %w", key, err)
 	}
 	return n, nil
+}
+
+func getEnvBool(key string, fallback bool) (bool, error) {
+	value := os.Getenv(key)
+	if value == "" {
+		return fallback, nil
+	}
+	parsed, err := strconv.ParseBool(value)
+	if err != nil {
+		return false, fmt.Errorf("invalid %s: %w", key, err)
+	}
+	return parsed, nil
 }

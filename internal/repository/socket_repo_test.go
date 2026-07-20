@@ -14,18 +14,21 @@ import (
 )
 
 func TestSafeReplayAllowlistRedactsSensitivePayloadsAndBoundsData(t *testing.T) {
+	if _, persist := safeReplayEvent(models.SocketServerEvent{Seq: 0, Ephemeral: true, Type: "generation.completed", Data: map[string]any{"status": "completed"}}); persist {
+		t.Fatal("ephemeral event entered replay storage")
+	}
 	for _, eventType := range []string{"content.delta", "chat.meta", "approval.requested", "error", "pong"} {
 		if _, persist := safeReplayEvent(models.SocketServerEvent{Type: eventType, Data: map[string]any{"content": "secret"}}); persist {
 			t.Fatalf("sensitive event %s was replayable", eventType)
 		}
 	}
-	resolved, persist := safeReplayEvent(models.SocketServerEvent{Type: "approval.resolved", Data: map[string]any{
+	resolved, persist := safeReplayEvent(models.SocketServerEvent{Seq: 1, Type: "approval.resolved", Data: map[string]any{
 		"approvalId": "a1", "decision": "approve", "status": "executed", "result": "secret tool output", "preview": "secret preview",
 	}})
 	if !persist || resolved.Data["result"] != nil || resolved.Data["preview"] != nil {
 		t.Fatalf("approval replay leaked sensitive data: %#v", resolved.Data)
 	}
-	trace, persist := safeReplayEvent(models.SocketServerEvent{Type: "trace", Data: map[string]any{
+	trace, persist := safeReplayEvent(models.SocketServerEvent{Seq: 1, Type: "trace", Data: map[string]any{
 		"summary": strings.Repeat("x", socketReplayMaxBytes*2), "rawOutput": "secret",
 	}})
 	if !persist || trace.Data["rawOutput"] != nil {
@@ -90,6 +93,62 @@ func TestMongoBackedRateAndLeaseCapacity(t *testing.T) {
 		)
 		if _, _, err := repo.IssueTicket(context.Background(), identity, now.Add(time.Hour), TicketPolicy{IssuePerMinute: 10, MaxOutstanding: 1}, now); !errors.Is(err, ErrSocketCapacity) {
 			mt.Fatalf("outstanding ticket capacity not enforced: %v", err)
+		}
+	})
+	mt.Run("distributed message dimensions", func(mt *mtest.T) {
+		repo := &SocketRepo{rateBuckets: mt.Coll}
+		for i := 0; i < 3; i++ {
+			mt.AddMockResponses(mtest.CreateSuccessResponse(bson.E{Key: "value", Value: bson.D{{Key: "count", Value: 1}}}))
+		}
+		err := repo.TakeMessageRate(context.Background(), models.SocketIdentity{CompanyID: "c", UserID: "u"}, "192.0.2.1", MessageRatePolicy{
+			UserPerMinute: 1, CompanyPerMinute: 1, IPPerMinute: 1,
+		}, time.Now())
+		if err != nil {
+			mt.Fatalf("distributed frame rate rejected first frame: %v", err)
+		}
+		mt.AddMockResponses(mtest.CreateCommandErrorResponse(mtest.CommandError{Code: 11000, Message: "duplicate"}))
+		if err := repo.TakeMessageRate(context.Background(), models.SocketIdentity{CompanyID: "c", UserID: "u"}, "192.0.2.1", MessageRatePolicy{
+			UserPerMinute: 1, CompanyPerMinute: 1, IPPerMinute: 1,
+		}, time.Now()); !errors.Is(err, ErrSocketRateLimited) {
+			mt.Fatalf("distributed frame rate did not survive reconnect: %v", err)
+		}
+	})
+}
+
+func TestReplayIsPagedByEventCountAndAggregateBytes(t *testing.T) {
+	mt := mtest.New(t, mtest.NewOptions().ClientType(mtest.Mock))
+	mt.Run("page", func(mt *mtest.T) {
+		repo := &SocketRepo{sequences: mt.Coll, events: mt.Coll}
+		namespace := mt.Coll.Database().Name() + "." + mt.Coll.Name()
+		docs := make([]bson.D, 0, replayPageMaxEvents+1)
+		for seq := int64(1); seq <= replayPageMaxEvents+1; seq++ {
+			docs = append(docs, bson.D{
+				{Key: "seq", Value: seq}, {Key: "type", Value: "trace"}, {Key: "sessionId", Value: "s"},
+				{Key: "timestamp", Value: time.Now()}, {Key: "data", Value: bson.D{{Key: "summary", Value: strings.Repeat("x", 3000)}}},
+			})
+		}
+		mt.AddMockResponses(
+			mtest.CreateCursorResponse(0, namespace, mtest.FirstBatch, bson.D{{Key: "seq", Value: int64(200)}}),
+			mtest.CreateCursorResponse(0, namespace, mtest.FirstBatch, bson.D{{Key: "seq", Value: int64(1)}}),
+			mtest.CreateCursorResponse(0, namespace, mtest.FirstBatch, docs...),
+		)
+		window, err := repo.ReplayEvents(context.Background(), models.SocketIdentity{CompanyID: "c", UserID: "u"}, "s", 0)
+		if err != nil {
+			mt.Fatal(err)
+		}
+		if !window.Truncated || !window.GapDetected || len(window.Events) > replayPageMaxEvents {
+			mt.Fatalf("replay page not bounded: %#v", window)
+		}
+		total := 0
+		for _, event := range window.Events {
+			payload, _ := json.Marshal(event)
+			total += len(payload)
+		}
+		if total > replayPageMaxBytes {
+			mt.Fatalf("replay page exceeded byte cap: %d", total)
+		}
+		if len(window.Events) > 0 && window.NextSeq != window.Events[len(window.Events)-1].Seq {
+			mt.Fatalf("nextSeq does not match last delivered event: %#v", window)
 		}
 	})
 }

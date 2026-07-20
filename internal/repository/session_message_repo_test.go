@@ -2,6 +2,7 @@ package repository
 
 import (
 	"context"
+	"strings"
 	"testing"
 	"time"
 
@@ -53,4 +54,16 @@ func TestListBySessionQueriesLatestThenReturnsChronological(t *testing.T) {
 			mt.Fatalf("query did not select latest messages: %s", started.Command)
 		}
 	})
+}
+
+func TestClientSessionListIncludesLegacyProfilesWithoutDeveloper(t *testing.T) {
+	filter := buildSessionListFilter("company", "user", "client", false)
+	alternatives, ok := filter["$or"].(bson.A)
+	if !ok || len(alternatives) != 3 {
+		t.Fatalf("client legacy profile alternatives missing: %#v", filter)
+	}
+	encoded, _ := bson.MarshalExtJSON(filter, false, false)
+	if strings.Contains(string(encoded), `"developer"`) {
+		t.Fatalf("client filter exposes developer sessions: %s", encoded)
+	}
 }

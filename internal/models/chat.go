@@ -25,6 +25,7 @@ type ChatSession struct {
 type ChatMessage struct {
 	ID         string           `bson:"_id" json:"id"`
 	SessionID  string           `bson:"sessionId" json:"sessionId"`
+	RequestID  string           `bson:"requestId,omitempty" json:"requestId,omitempty"`
 	Role       string           `bson:"role" json:"role"` // "user", "assistant", "system", "tool"
 	Content    string           `bson:"content" json:"content"`
 	ToolCalls  []ToolCallResult `bson:"toolCalls,omitempty" json:"toolCalls,omitempty"`
@@ -78,6 +79,7 @@ type ChatRequest struct {
 	UserID         string `json:"userId"`
 	ConversationID string `json:"conversationId,omitempty"`
 	Question       string `json:"question"`
+	RequestID      string `json:"requestId,omitempty"`
 	Stream         bool   `json:"stream,omitempty"`
 	// AccessProfile and ProjectID are only used when a new session is
 	// created by this request (no conversationId). Existing sessions keep

@@ -12,7 +12,6 @@ import (
 	"regexp"
 	"strings"
 	"sync"
-	"sync/atomic"
 	"time"
 
 	"github.com/Dev2dot-Solutions/dev2-chat/internal/models"
@@ -42,6 +41,7 @@ type socketStore interface {
 	AcquireGeneration(context.Context, models.SocketIdentity, repository.GenerationPolicy, time.Time) (*models.SocketLease, error)
 	RenewLease(context.Context, *models.SocketLease, time.Duration, time.Time) error
 	ReleaseLease(context.Context, *models.SocketLease)
+	TakeMessageRate(context.Context, models.SocketIdentity, string, repository.MessageRatePolicy, time.Time) error
 	RecordEvent(context.Context, models.SocketIdentity, models.SocketServerEvent) (*models.SocketServerEvent, bool, error)
 	ReplayEvents(context.Context, models.SocketIdentity, string, int64) (*models.SocketReplay, error)
 	BeginReceipt(context.Context, models.SocketActionBinding, string, time.Time) (*models.SocketActionReceipt, bool, error)
@@ -63,20 +63,29 @@ type SocketOptions struct {
 	GenerationPolicy     repository.GenerationPolicy
 	MessagesPerMinute    int
 	MessageBurst         int
+	MessageRatePolicy    repository.MessageRatePolicy
+	HandshakeRate        int
+	HandshakeBurst       int
 }
 
 type SocketHandler struct {
-	store          socketStore
-	agent          *AgentHandler
-	chat           *ChatHandler
-	options        SocketOptions
-	trustedProxies []*net.IPNet
-	upgrader       websocket.Upgrader
+	store                socketStore
+	agent                *AgentHandler
+	chat                 *ChatHandler
+	options              SocketOptions
+	trustedProxies       []*net.IPNet
+	handshakeMu          sync.Mutex
+	handshakes           map[string]*tokenBucket
+	currentAuthorization func(context.Context, models.SocketIdentity) error
+	sessionAuthorization func(context.Context, models.SocketIdentity, string) (*models.ChatSession, error)
+	upgrader             websocket.Upgrader
 }
 
 func NewSocketHandler(store socketStore, agent *AgentHandler, chat *ChatHandler, options SocketOptions) *SocketHandler {
 	applySocketDefaults(&options)
-	h := &SocketHandler{store: store, agent: agent, chat: chat, options: options}
+	h := &SocketHandler{store: store, agent: agent, chat: chat, options: options, handshakes: make(map[string]*tokenBucket)}
+	h.currentAuthorization = h.checkCurrentAuthorization
+	h.sessionAuthorization = h.authorizeSocketSession
 	for _, cidr := range options.TrustedProxyCIDRs {
 		if _, network, err := net.ParseCIDR(strings.TrimSpace(cidr)); err == nil {
 			h.trustedProxies = append(h.trustedProxies, network)
@@ -149,6 +158,21 @@ func applySocketDefaults(options *SocketOptions) {
 	}
 	if options.MessageBurst <= 0 {
 		options.MessageBurst = 20
+	}
+	if options.MessageRatePolicy.UserPerMinute <= 0 {
+		options.MessageRatePolicy.UserPerMinute = 120
+	}
+	if options.MessageRatePolicy.CompanyPerMinute <= 0 {
+		options.MessageRatePolicy.CompanyPerMinute = 1200
+	}
+	if options.MessageRatePolicy.IPPerMinute <= 0 {
+		options.MessageRatePolicy.IPPerMinute = 600
+	}
+	if options.HandshakeRate <= 0 {
+		options.HandshakeRate = 30
+	}
+	if options.HandshakeBurst <= 0 {
+		options.HandshakeBurst = 10
 	}
 }
 
@@ -243,6 +267,11 @@ func (h *SocketHandler) Connect(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	now := time.Now().UTC()
+	clientIP := h.remoteIP(r)
+	if !h.allowHandshake(clientIP, now) {
+		respondError(w, http.StatusTooManyRequests, "socket handshake rate exceeded")
+		return
+	}
 	ticket, err := h.store.ConsumeTicket(r.Context(), token, now)
 	if err != nil {
 		respondError(w, http.StatusInternalServerError, "failed to consume socket ticket")
@@ -252,7 +281,7 @@ func (h *SocketHandler) Connect(w http.ResponseWriter, r *http.Request) {
 		respondError(w, http.StatusUnauthorized, "invalid or expired socket ticket")
 		return
 	}
-	lease, err := h.store.AcquireConnection(r.Context(), ticket.SocketIdentity, h.remoteIP(r), h.options.ConnectionPolicy, now)
+	lease, err := h.store.AcquireConnection(r.Context(), ticket.SocketIdentity, clientIP, h.options.ConnectionPolicy, now)
 	if errors.Is(err, repository.ErrSocketCapacity) || errors.Is(err, repository.ErrSocketRateLimited) {
 		respondError(w, http.StatusTooManyRequests, "socket connection limit reached")
 		return
@@ -271,7 +300,8 @@ func (h *SocketHandler) Connect(w http.ResponseWriter, r *http.Request) {
 	ctx, cancel := context.WithCancel(r.Context())
 	c := &socketConnection{
 		handler: h, conn: conn, identity: ticket.SocketIdentity, socketExpiresAt: ticket.SocketExpiresAt,
-		ctx: ctx, cancel: cancel, send: make(chan models.SocketServerEvent, h.options.SendQueue),
+		clientIP: clientIP,
+		ctx:      ctx, cancel: cancel, send: make(chan models.SocketServerEvent, h.options.SendQueue),
 		generations: make(map[string]context.CancelFunc), actions: make(chan struct{}, 16), connectionLease: lease,
 		bucket: newTokenBucket(h.options.MessageBurst, h.options.MessagesPerMinute, now),
 	}
@@ -284,6 +314,7 @@ type socketConnection struct {
 	identity        models.SocketIdentity
 	socketExpiresAt time.Time
 	connectionLease *models.SocketLease
+	clientIP        string
 	ctx             context.Context
 	cancel          context.CancelFunc
 	send            chan models.SocketServerEvent
@@ -294,7 +325,6 @@ type socketConnection struct {
 	closeOnce       sync.Once
 	closeCode       int
 	closeText       string
-	localSeq        atomic.Int64
 	bucket          *tokenBucket
 }
 
@@ -347,38 +377,34 @@ func (c *socketConnection) readLoop() {
 			return
 		}
 		_ = c.conn.SetReadDeadline(time.Now().Add(c.handler.options.IdleTimeout))
+		if err := c.allowInbound(time.Now().UTC()); err != nil {
+			if errors.Is(err, repository.ErrSocketRateLimited) {
+				c.shutdown(socketCloseRate, "message rate exceeded")
+			} else {
+				c.shutdown(socketCloseBusy, "message rate service unavailable")
+			}
+			return
+		}
 		if messageType != websocket.TextMessage {
-			c.sendEphemeral("error", "", "", errorData("invalid_message", "text messages are required"))
-			continue
+			c.shutdown(websocket.CloseUnsupportedData, "text messages are required")
+			return
 		}
 		msg, err := parseSocketMessage(payload)
 		if err != nil {
-			c.sendEphemeral("error", "", "", errorData("invalid_message", err.Error()))
-			continue
+			c.shutdown(websocket.ClosePolicyViolation, "invalid message envelope")
+			return
 		}
 		switch msg.Type {
 		case "ping":
 			c.sendEphemeral("pong", msg.RequestID, msg.SessionID, map[string]any{})
 			continue
 		case "session.resume":
-			if !c.bucket.Allow(time.Now()) {
-				c.shutdown(socketCloseRate, "message rate exceeded")
-				return
-			}
 			c.handleResume(msg) // synchronous: no later action can overtake replay
 			continue
 		case "generation.cancel":
-			if !c.bucket.Allow(time.Now()) {
-				c.shutdown(socketCloseRate, "message rate exceeded")
-				return
-			}
 			c.handleCancel(msg)
 			continue
 		case "chat.send", "approval.decide":
-			if !c.bucket.Allow(time.Now()) {
-				c.shutdown(socketCloseRate, "message rate exceeded")
-				return
-			}
 		default:
 			c.sendEphemeral("error", msg.RequestID, msg.SessionID, errorData("unsupported_type", "unsupported message type"))
 			continue
@@ -391,6 +417,16 @@ func (c *socketConnection) readLoop() {
 			return
 		}
 	}
+}
+
+func (c *socketConnection) allowInbound(now time.Time) error {
+	if err := c.handler.store.TakeMessageRate(c.ctx, c.identity, c.clientIP, c.handler.options.MessageRatePolicy, now); err != nil {
+		return err
+	}
+	if !c.bucket.Allow(now) {
+		return repository.ErrSocketRateLimited
+	}
+	return nil
 }
 
 func (c *socketConnection) writeLoop() {
@@ -446,15 +482,13 @@ func (c *socketConnection) handleChatSend(msg models.SocketClientMessage) {
 		c.sendError(msg, "scope_mismatch", "chat scope does not match socket ticket")
 		return
 	}
+	if err := c.revalidateCurrentAuthorization(); err != nil {
+		c.closeAuthorizationError(err)
+		return
+	}
 	if msg.SessionID != "" {
 		if _, err := c.authorizeSession(msg.SessionID); err != nil {
 			c.sendError(msg, "session_forbidden", err.Error())
-			return
-		}
-	}
-	if c.identity.AccessProfile == models.AccessProfileDeveloper {
-		if err := c.revalidateCurrentAuthorization(); err != nil {
-			c.closeAuthorizationError(err)
 			return
 		}
 	}
@@ -478,7 +512,7 @@ func (c *socketConnection) handleChatSend(msg models.SocketClientMessage) {
 	}
 	genLease, err := c.handler.store.AcquireGeneration(c.ctx, c.identity, c.handler.options.GenerationPolicy, time.Now())
 	if err != nil {
-		c.updateReceiptBackground(binding, "failed", msg.SessionID, "error", errorData("generation_capacity", "generation limit reached"))
+		c.updateReceiptBackground(binding, "failed", msg.SessionID, "error", terminalErrorData("generation_capacity", "generation limit reached"))
 		c.shutdown(socketCloseRate, "generation limit reached")
 		return
 	}
@@ -486,7 +520,7 @@ func (c *socketConnection) handleChatSend(msg models.SocketClientMessage) {
 	genCtx, cancel := context.WithCancel(c.ctx)
 	if !c.registerGeneration(msg.RequestID, cancel) {
 		cancel()
-		c.updateReceiptBackground(binding, "failed", msg.SessionID, "error", errorData("request_conflict", "requestId is already active"))
+		c.updateReceiptBackground(binding, "failed", msg.SessionID, "error", terminalErrorData("request_conflict", "requestId is already active"))
 		c.sendError(msg, "request_conflict", "requestId is already active")
 		return
 	}
@@ -494,14 +528,15 @@ func (c *socketConnection) handleChatSend(msg models.SocketClientMessage) {
 	defer func() { cancel(); c.unregisterGeneration(msg.RequestID) }()
 	req := models.ChatRequest{
 		CompanyID: c.identity.CompanyID, UserID: c.identity.UserID, ConversationID: msg.SessionID,
-		Question: strings.TrimSpace(data.Message), AccessProfile: data.AccessProfile, ProjectID: data.ProjectID,
+		Question: strings.TrimSpace(data.Message), RequestID: msg.RequestID,
+		AccessProfile: data.AccessProfile, ProjectID: data.ProjectID,
 	}
 	request := requestWithSocketIdentity(genCtx, c.identity)
 	prepared, status, errMsg := c.handler.agent.prepareAgentRequest(request, req)
 	if errMsg != "" {
-		failed := map[string]any{"code": "chat_rejected", "message": errMsg, "status": status}
+		failed := map[string]any{"code": "chat_rejected", "message": errMsg, "status": status, "terminal": true}
 		c.updateReceiptBackground(binding, "failed", msg.SessionID, "error", failed)
-		c.sendEvent("error", msg.RequestID, msg.SessionID, failed)
+		c.sendEphemeral("error", msg.RequestID, msg.SessionID, failed)
 		return
 	}
 	sessionID := prepared.session.ID
@@ -509,12 +544,12 @@ func (c *socketConnection) handleChatSend(msg models.SocketClientMessage) {
 		c.shutdown(socketCloseBusy, "receipt persistence unavailable")
 		return
 	}
-	c.sendEvent("chat.accepted", msg.RequestID, sessionID, map[string]any{"idempotencyKey": msg.IdempotencyKey})
+	c.sendEvent("chat.accepted", msg.RequestID, sessionID, map[string]any{"idempotencyKey": msg.IdempotencyKey, "sessionId": sessionID})
 	completed := c.handler.agent.completeAgentRequest(request, prepared, func(event models.ToolTraceEvent) {
 		c.sendEvent("trace", msg.RequestID, sessionID, objectData(event))
 	})
 	if completed.result.cancelled || genCtx.Err() != nil {
-		data := map[string]any{"targetRequestId": msg.RequestID, "status": "cancelled"}
+		data := map[string]any{"targetRequestId": msg.RequestID, "status": "cancelled", "terminal": true}
 		c.persistTerminal(binding, "cancelled", "generation.cancelled", msg.RequestID, sessionID, data)
 		return
 	}
@@ -526,10 +561,14 @@ func (c *socketConnection) handleChatSend(msg models.SocketClientMessage) {
 	for _, approval := range completed.result.pendingApprovals {
 		c.sendEvent("approval.requested", msg.RequestID, sessionID, objectData(approval))
 	}
-	c.persistTerminal(binding, "completed", "generation.completed", msg.RequestID, sessionID, map[string]any{"status": "completed"})
+	c.persistTerminal(binding, "completed", "generation.completed", msg.RequestID, sessionID, map[string]any{"status": "completed", "terminal": true})
 }
 
 func (c *socketConnection) handleApproval(msg models.SocketClientMessage) {
+	if c.identity.AccessProfile != models.AccessProfileDeveloper || !c.identity.IsAdmin {
+		c.shutdown(socketCloseForbidden, "approvals require developer admin access")
+		return
+	}
 	var data struct{ ApprovalID, Decision string }
 	if err := decodeSocketData(msg, &data); err != nil || data.ApprovalID == "" ||
 		(data.Decision != models.ApprovalDecisionApprove && data.Decision != models.ApprovalDecisionReject) {
@@ -577,12 +616,12 @@ func (c *socketConnection) handleApproval(msg models.SocketClientMessage) {
 	}
 	status, result, errMsg := c.handler.chat.decideApproval(requestWithSocketIdentity(c.ctx, c.identity), data.ApprovalID, data.Decision)
 	if errMsg != "" {
-		failed := map[string]any{"code": "approval_failed", "message": errMsg, "status": status}
+		failed := map[string]any{"code": "approval_failed", "message": errMsg, "status": status, "terminal": true}
 		c.updateReceiptBackground(binding, "failed", rec.SessionID, "error", failed)
-		c.sendEvent("error", msg.RequestID, rec.SessionID, failed)
+		c.sendEphemeral("error", msg.RequestID, rec.SessionID, failed)
 		return
 	}
-	safeResult := map[string]any{"approvalId": data.ApprovalID, "decision": data.Decision, "status": result["status"]}
+	safeResult := map[string]any{"approvalId": data.ApprovalID, "decision": data.Decision, "status": result["status"], "terminal": true}
 	c.persistTerminalWithLive(binding, "completed", "approval.resolved", msg.RequestID, rec.SessionID, safeResult, result)
 }
 
@@ -617,6 +656,10 @@ func (c *socketConnection) handleResume(msg models.SocketClientMessage) {
 		c.sendError(msg, "scope_mismatch", "sessionId values do not match")
 		return
 	}
+	if err := c.revalidateCurrentAuthorization(); err != nil {
+		c.closeAuthorizationError(err)
+		return
+	}
 	if _, err := c.authorizeSession(data.SessionID); err != nil {
 		c.sendError(msg, "session_forbidden", err.Error())
 		return
@@ -624,14 +667,28 @@ func (c *socketConnection) handleResume(msg models.SocketClientMessage) {
 	c.eventMu.Lock()
 	window, err := c.handler.store.ReplayEvents(c.ctx, c.identity, data.SessionID, data.LastSeq)
 	if err == nil {
-		for _, event := range window.Events {
+		events := window.Events
+		available := cap(c.send) - len(c.send) - 1
+		if available < 0 {
+			available = 0
+		}
+		if len(events) > available {
+			events = events[:available]
+			window.Truncated, window.GapDetected = true, true
+			window.NextSeq = data.LastSeq
+			if len(events) > 0 {
+				window.NextSeq = events[len(events)-1].Seq
+			}
+		}
+		for _, event := range events {
 			if !c.enqueue(event) {
 				break
 			}
 		}
 		c.sendEphemeral("replay.completed", msg.RequestID, data.SessionID, map[string]any{
-			"replayed": len(window.Events), "afterSeq": data.LastSeq,
+			"replayed": len(events), "afterSeq": data.LastSeq,
 			"earliestAvailableSeq": window.EarliestAvailableSeq, "latestSeq": window.LatestSeq, "gapDetected": window.GapDetected,
+			"truncated": window.Truncated, "nextSeq": window.NextSeq,
 		})
 	}
 	c.eventMu.Unlock()
@@ -642,24 +699,31 @@ func (c *socketConnection) handleResume(msg models.SocketClientMessage) {
 }
 
 func (c *socketConnection) authorizeSession(sessionID string) (*models.ChatSession, error) {
-	session, err := c.handler.chat.sessionRepo.GetByID(c.ctx, sessionID)
+	return c.handler.sessionAuthorization(c.ctx, c.identity, sessionID)
+}
+
+func (h *SocketHandler) authorizeSocketSession(ctx context.Context, identity models.SocketIdentity, sessionID string) (*models.ChatSession, error) {
+	if h.chat == nil {
+		return nil, errors.New("session authorization unavailable")
+	}
+	session, err := h.chat.sessionRepo.GetByID(ctx, sessionID)
 	if err != nil {
 		return nil, errors.New("failed to load session")
 	}
 	if session == nil {
 		return nil, errors.New("session not found")
 	}
-	if session.CompanyID != c.identity.CompanyID || session.UserID != c.identity.UserID || models.NormalizeAccessProfile(session.AccessProfile) != c.identity.AccessProfile {
+	if session.CompanyID != identity.CompanyID || session.UserID != identity.UserID || models.NormalizeAccessProfile(session.AccessProfile) != identity.AccessProfile {
 		return nil, errors.New("session does not match socket ticket")
 	}
 	if session.ProjectID == "" {
-		bound, err := c.handler.chat.sessionRepo.BindLegacyProject(c.ctx, session.ID, c.identity.CompanyID, c.identity.UserID, c.identity.AccessProfile, c.identity.ProjectID)
+		bound, err := h.chat.sessionRepo.BindLegacyProject(ctx, session.ID, identity.CompanyID, identity.UserID, identity.AccessProfile, identity.ProjectID)
 		if err != nil {
 			return nil, errors.New("failed to bind legacy session")
 		}
 		session = bound
 	}
-	if session == nil || session.ProjectID != c.identity.ProjectID {
+	if session == nil || session.ProjectID != identity.ProjectID {
 		return nil, errors.New("session does not match socket ticket")
 	}
 	return session, nil
@@ -669,21 +733,28 @@ func (c *socketConnection) revalidateCurrentAuthorization() error {
 	if time.Now().After(c.socketExpiresAt) {
 		return errors.New("authentication expired")
 	}
-	if c.identity.AccessProfile == models.AccessProfileDeveloper && !c.identity.IsAdmin {
+	return c.handler.currentAuthorization(c.ctx, c.identity)
+}
+
+func (h *SocketHandler) checkCurrentAuthorization(ctx context.Context, identity models.SocketIdentity) error {
+	if identity.AccessProfile == models.AccessProfileDeveloper && !identity.IsAdmin {
 		return errors.New("developer authorization expired")
 	}
-	request := requestWithSocketIdentity(c.ctx, c.identity)
-	project, err := c.handler.agent.lookupProjectFresh(request, c.identity.CompanyID, c.identity.ProjectID)
+	if h.agent == nil {
+		return errAuthorizationUnavailable
+	}
+	request := requestWithSocketIdentity(ctx, identity)
+	project, err := h.agent.lookupProjectFresh(request, identity.CompanyID, identity.ProjectID)
 	if err != nil {
 		return errAuthorizationUnavailable
 	}
-	if project == nil || (project.CompanyID != "" && project.CompanyID != c.identity.CompanyID) {
+	if project == nil || (project.CompanyID != "" && project.CompanyID != identity.CompanyID) {
 		return errors.New("project authorization unavailable")
 	}
-	if c.identity.AccessProfile == models.AccessProfileDeveloper && !project.Visibility.Developer {
+	if identity.AccessProfile == models.AccessProfileDeveloper && !project.Visibility.Developer {
 		return errors.New("developer project access revoked")
 	}
-	if c.identity.AccessProfile == models.AccessProfileClient && !project.Visibility.Client {
+	if identity.AccessProfile == models.AccessProfileClient && !project.Visibility.Client {
 		return errors.New("client project access revoked")
 	}
 	return nil
@@ -698,26 +769,29 @@ func (c *socketConnection) actionBinding(msg models.SocketClientMessage, payload
 }
 
 func (c *socketConnection) replayReceipt(msg models.SocketClientMessage, binding models.SocketActionBinding, receipt *models.SocketActionReceipt) {
+	if err := c.revalidateCurrentAuthorization(); err != nil {
+		c.closeAuthorizationError(err)
+		return
+	}
 	if receipt.SessionID != "" {
 		if _, err := c.authorizeSession(receipt.SessionID); err != nil {
 			c.sendError(msg, "session_forbidden", err.Error())
 			return
 		}
 	}
-	if binding.ActionType == models.SocketActionApprovalDecide || c.identity.AccessProfile == models.AccessProfileDeveloper {
-		if err := c.revalidateCurrentAuthorization(); err != nil {
-			c.closeAuthorizationError(err)
-			return
-		}
-	}
 	if receipt.SessionID != "" && binding.ActionType == models.SocketActionChatSend {
-		c.sendEvent("chat.accepted", msg.RequestID, receipt.SessionID, map[string]any{"duplicate": true})
+		c.sendEphemeral("chat.accepted", msg.RequestID, receipt.SessionID, map[string]any{"duplicate": true, "sessionId": receipt.SessionID})
 	}
 	if receipt.FinalEventType != "" {
-		c.sendEvent(receipt.FinalEventType, msg.RequestID, receipt.SessionID, receipt.FinalData)
+		data := cloneData(receipt.FinalData)
+		data["terminal"] = true
+		if binding.ActionType == models.SocketActionChatSend && receipt.FinalEventType == "generation.completed" {
+			data["hydrationRequired"] = true
+		}
+		c.sendEphemeral(receipt.FinalEventType, msg.RequestID, receipt.SessionID, data)
 		return
 	}
-	c.sendError(msg, "action_in_progress", "action is already pending")
+	c.sendEphemeral("error", msg.RequestID, msg.SessionID, map[string]any{"code": "action_in_progress", "message": "action is already pending", "terminal": false})
 }
 
 func (c *socketConnection) closeAuthorizationError(err error) {
@@ -742,11 +816,11 @@ func (c *socketConnection) sendEvent(eventType, requestID, sessionID string, dat
 }
 
 func (c *socketConnection) sendEphemeral(eventType, requestID, sessionID string, data map[string]any) {
-	c.enqueue(models.SocketServerEvent{Seq: c.localSeq.Add(1), Type: eventType, RequestID: requestID, SessionID: sessionID, Timestamp: time.Now().UTC(), Data: data})
+	c.enqueue(models.SocketServerEvent{Seq: 0, Ephemeral: true, Type: eventType, RequestID: requestID, SessionID: sessionID, Timestamp: time.Now().UTC(), Data: data})
 }
 
 func (c *socketConnection) sendError(msg models.SocketClientMessage, code, message string) {
-	c.sendEphemeral("error", msg.RequestID, msg.SessionID, errorData(code, message))
+	c.sendEphemeral("error", msg.RequestID, msg.SessionID, terminalErrorData(code, message))
 }
 
 func (c *socketConnection) persistTerminal(binding models.SocketActionBinding, state, eventType, requestID, sessionID string, data map[string]any) {
@@ -975,6 +1049,28 @@ func (h *SocketHandler) remoteIP(r *http.Request) string {
 	return peer
 }
 
+func (h *SocketHandler) allowHandshake(ip string, now time.Time) bool {
+	h.handshakeMu.Lock()
+	bucket := h.handshakes[ip]
+	if bucket == nil {
+		if len(h.handshakes) >= 10000 {
+			for key, candidate := range h.handshakes {
+				if now.Sub(candidate.LastActivity()) > 10*time.Minute {
+					delete(h.handshakes, key)
+				}
+			}
+			if len(h.handshakes) >= 10000 {
+				h.handshakeMu.Unlock()
+				return false
+			}
+		}
+		bucket = newTokenBucket(h.options.HandshakeBurst, h.options.HandshakeRate, now)
+		h.handshakes[ip] = bucket
+	}
+	h.handshakeMu.Unlock()
+	return bucket.Allow(now)
+}
+
 func objectData(value any) map[string]any {
 	payload, _ := json.Marshal(value)
 	var data map[string]any
@@ -987,6 +1083,16 @@ func objectData(value any) map[string]any {
 
 func errorData(code, message string) map[string]any {
 	return map[string]any{"code": code, "message": message}
+}
+func terminalErrorData(code, message string) map[string]any {
+	return map[string]any{"code": code, "message": message, "terminal": true}
+}
+func cloneData(data map[string]any) map[string]any {
+	clone := make(map[string]any, len(data)+2)
+	for key, value := range data {
+		clone[key] = value
+	}
+	return clone
 }
 func validActionIdentifiers(requestID, idempotencyKey string) bool {
 	return requestID != "" && len(requestID) <= 128 && idempotencyKey != "" && len(idempotencyKey) <= 256
@@ -1023,4 +1129,10 @@ func (b *tokenBucket) Allow(now time.Time) bool {
 	}
 	b.tokens--
 	return true
+}
+
+func (b *tokenBucket) LastActivity() time.Time {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.last
 }

@@ -19,15 +19,17 @@ import (
 )
 
 type memorySocketStore struct {
-	mu           sync.Mutex
-	next         int
-	tickets      map[string]*models.SocketTicket
-	seq          map[string]int64
-	events       []storedSocketEvent
-	receipts     map[string]*models.SocketActionReceipt
-	activeLeases int
-	maxLeases    int
-	consumeCalls int
+	mu                sync.Mutex
+	next              int
+	tickets           map[string]*models.SocketTicket
+	seq               map[string]int64
+	events            []storedSocketEvent
+	receipts          map[string]*models.SocketActionReceipt
+	activeLeases      int
+	maxLeases         int
+	consumeCalls      int
+	distributedFrames int
+	distributedLimit  int
 }
 
 type storedSocketEvent struct {
@@ -177,6 +179,16 @@ func (s *memorySocketStore) ReleaseLease(_ context.Context, lease *models.Socket
 		s.activeLeases--
 	}
 	s.mu.Unlock()
+}
+
+func (s *memorySocketStore) TakeMessageRate(_ context.Context, _ models.SocketIdentity, _ string, _ repository.MessageRatePolicy, _ time.Time) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.distributedFrames++
+	if s.distributedLimit > 0 && s.distributedFrames > s.distributedLimit {
+		return repository.ErrSocketRateLimited
+	}
+	return nil
 }
 
 func TestSocketTicketExpiresAndIsConsumedOnceAtomically(t *testing.T) {
@@ -338,22 +350,16 @@ func TestSocketUsesRateAndForbiddenCloseCodes(t *testing.T) {
 		if err := conn.WriteJSON(map[string]any{"type": "ping", "data": map[string]any{}}); err != nil {
 			t.Fatal(err)
 		}
-		if err := conn.ReadJSON(&response); err != nil || response.Type != "pong" {
-			t.Fatalf("ping consumed action capacity: %#v %v", response, err)
+		_, _, err = conn.ReadMessage()
+		var closeErr *websocket.CloseError
+		if !errors.As(err, &closeErr) || closeErr.Code != socketCloseRate {
+			t.Fatalf("rated ping did not close with 4429: %v", err)
 		}
 		store.mu.Lock()
 		persistedEvents := len(store.events)
 		store.mu.Unlock()
 		if persistedEvents != 0 {
 			t.Fatalf("routine error/ping events were persisted: %d", persistedEvents)
-		}
-		if err := conn.WriteJSON(message); err != nil {
-			t.Fatal(err)
-		}
-		_, _, err = conn.ReadMessage()
-		var closeErr *websocket.CloseError
-		if !errors.As(err, &closeErr) || closeErr.Code != socketCloseRate {
-			t.Fatalf("expected 4429, got %v", err)
 		}
 	})
 
@@ -649,5 +655,190 @@ func TestForwardedIPRequiresTrustedProxyPeer(t *testing.T) {
 	})).ServeHTTP(httptest.NewRecorder(), request)
 	if trustedIP != "198.51.100.20" {
 		t.Fatalf("trusted proxy IP was not used: %q", trustedIP)
+	}
+}
+
+func TestEphemeralErrorsUseZeroSequence(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	connection := &socketConnection{ctx: ctx, cancel: cancel, send: make(chan models.SocketServerEvent, 1), generations: make(map[string]context.CancelFunc)}
+	connection.sendError(models.SocketClientMessage{RequestID: "r", SessionID: "s"}, "invalid", "bad")
+	event := <-connection.send
+	if event.Seq != 0 || !event.Ephemeral || event.Type != "error" {
+		t.Fatalf("ephemeral error entered durable cursor space: %#v", event)
+	}
+}
+
+func TestClientRevocationFailsClosedForSendResumeAndReceiptReplay(t *testing.T) {
+	newConnection := func() *socketConnection {
+		store := newMemorySocketStore()
+		handler := NewSocketHandler(store, nil, nil, SocketOptions{})
+		handler.currentAuthorization = func(context.Context, models.SocketIdentity) error {
+			return errors.New("client project access revoked")
+		}
+		handler.sessionAuthorization = func(context.Context, models.SocketIdentity, string) (*models.ChatSession, error) {
+			return &models.ChatSession{ID: "s", CompanyID: "c", UserID: "u", AccessProfile: "client", ProjectID: "p"}, nil
+		}
+		ctx, cancel := context.WithCancel(context.Background())
+		return &socketConnection{
+			handler: handler, identity: models.SocketIdentity{CompanyID: "c", UserID: "u", AccessProfile: "client", ProjectID: "p"},
+			socketExpiresAt: time.Now().Add(time.Hour), ctx: ctx, cancel: cancel,
+			send: make(chan models.SocketServerEvent, 4), generations: make(map[string]context.CancelFunc),
+		}
+	}
+
+	send := newConnection()
+	msg, _ := parseSocketMessage([]byte(`{"type":"chat.send","requestId":"r","idempotencyKey":"k","data":{"message":"hello","projectId":"p","accessProfile":"client"}}`))
+	send.handleChatSend(msg)
+	if send.closeCode != socketCloseForbidden {
+		t.Fatalf("revoked client send close=%d", send.closeCode)
+	}
+
+	resume := newConnection()
+	resumeMsg, _ := parseSocketMessage([]byte(`{"type":"session.resume","data":{"sessionId":"s","lastSeq":0}}`))
+	resume.handleResume(resumeMsg)
+	if resume.closeCode != socketCloseForbidden {
+		t.Fatalf("revoked client resume close=%d", resume.closeCode)
+	}
+
+	replay := newConnection()
+	binding := models.SocketActionBinding{CompanyID: "c", UserID: "u", AccessProfile: "client", ProjectID: "p", ActionType: models.SocketActionChatSend}
+	replay.replayReceipt(models.SocketClientMessage{Type: models.SocketActionChatSend}, binding, &models.SocketActionReceipt{})
+	if replay.closeCode != socketCloseForbidden {
+		t.Fatalf("revoked client receipt replay close=%d", replay.closeCode)
+	}
+}
+
+func TestDuplicateCompletedActionRequiresHydrationAndPendingIsNonterminal(t *testing.T) {
+	store := newMemorySocketStore()
+	handler := NewSocketHandler(store, nil, nil, SocketOptions{})
+	handler.currentAuthorization = func(context.Context, models.SocketIdentity) error { return nil }
+	handler.sessionAuthorization = func(context.Context, models.SocketIdentity, string) (*models.ChatSession, error) {
+		return &models.ChatSession{ID: "s", CompanyID: "c", UserID: "u", AccessProfile: "client", ProjectID: "p"}, nil
+	}
+	connection := func() *socketConnection {
+		ctx, cancel := context.WithCancel(context.Background())
+		return &socketConnection{
+			handler: handler, identity: models.SocketIdentity{CompanyID: "c", UserID: "u", AccessProfile: "client", ProjectID: "p"},
+			socketExpiresAt: time.Now().Add(time.Hour), ctx: ctx, cancel: cancel,
+			send: make(chan models.SocketServerEvent, 4), generations: make(map[string]context.CancelFunc),
+		}
+	}
+	binding := models.SocketActionBinding{CompanyID: "c", UserID: "u", AccessProfile: "client", ProjectID: "p", ActionType: models.SocketActionChatSend}
+	completed := connection()
+	completed.replayReceipt(models.SocketClientMessage{Type: models.SocketActionChatSend, RequestID: "retry"}, binding, &models.SocketActionReceipt{
+		SessionID: "s", FinalEventType: "generation.completed", FinalData: map[string]any{"status": "completed"},
+	})
+	accepted, terminal := <-completed.send, <-completed.send
+	if accepted.Type != "chat.accepted" || accepted.Data["sessionId"] != "s" || !accepted.Ephemeral || accepted.Seq != 0 ||
+		terminal.Data["hydrationRequired"] != true || terminal.Data["terminal"] != true || !terminal.Ephemeral || terminal.Seq != 0 {
+		t.Fatalf("lost-accepted recovery metadata missing: accepted=%#v terminal=%#v", accepted, terminal)
+	}
+
+	pending := connection()
+	pending.replayReceipt(models.SocketClientMessage{Type: models.SocketActionChatSend}, binding, &models.SocketActionReceipt{})
+	event := <-pending.send
+	if event.Type != "error" || event.Data["terminal"] != false || event.Seq != 0 || !event.Ephemeral {
+		t.Fatalf("pending receipt error is not explicitly nonterminal: %#v", event)
+	}
+}
+
+func TestClientSocketCannotDecideApproval(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	connection := &socketConnection{
+		identity: models.SocketIdentity{AccessProfile: "client"}, ctx: ctx, cancel: cancel,
+		send: make(chan models.SocketServerEvent, 1), generations: make(map[string]context.CancelFunc),
+	}
+	connection.handleApproval(models.SocketClientMessage{})
+	if connection.closeCode != socketCloseForbidden {
+		t.Fatalf("client approval was not forbidden: %d", connection.closeCode)
+	}
+}
+
+func TestDistributedFrameRateSurvivesReconnectAndRatesPing(t *testing.T) {
+	store := newMemorySocketStore()
+	store.distributedLimit = 1
+	connect := func() (*websocket.Conn, func()) {
+		now := time.Now()
+		identity := models.SocketIdentity{UserID: "u", CompanyID: "c", AccessProfile: "client", ProjectID: "p", AuthExpiresAt: now.Add(time.Hour)}
+		token, _, _ := store.IssueTicket(context.Background(), identity, now.Add(time.Hour), repository.TicketPolicy{}, now)
+		handler := NewSocketHandler(store, nil, nil, SocketOptions{AllowedOrigins: []string{"https://dev2.solutions"}})
+		server := httptest.NewServer(http.HandlerFunc(handler.Connect))
+		dialer := websocket.Dialer{Subprotocols: []string{baseProtocol, ticketProtocolPrefix + token}}
+		conn, _, err := dialer.Dial("ws"+strings.TrimPrefix(server.URL, "http")+"/chat/ws", http.Header{"Origin": []string{"https://dev2.solutions"}})
+		if err != nil {
+			t.Fatal(err)
+		}
+		var ready models.SocketServerEvent
+		if err := conn.ReadJSON(&ready); err != nil {
+			t.Fatal(err)
+		}
+		return conn, func() { conn.Close(); server.Close() }
+	}
+	first, closeFirst := connect()
+	if err := first.WriteJSON(map[string]any{"type": "ping", "data": map[string]any{}}); err != nil {
+		t.Fatal(err)
+	}
+	var pong models.SocketServerEvent
+	if err := first.ReadJSON(&pong); err != nil || pong.Type != "pong" {
+		t.Fatalf("first ping failed: %#v %v", pong, err)
+	}
+	closeFirst()
+
+	second, closeSecond := connect()
+	defer closeSecond()
+	if err := second.WriteJSON(map[string]any{"type": "ping", "data": map[string]any{}}); err != nil {
+		t.Fatal(err)
+	}
+	_, _, err := second.ReadMessage()
+	var closeErr *websocket.CloseError
+	if !errors.As(err, &closeErr) || closeErr.Code != socketCloseRate {
+		t.Fatalf("reconnect reset distributed rate: %v", err)
+	}
+}
+
+func TestMalformedFrameClosesWithoutErrorResponse(t *testing.T) {
+	store := newMemorySocketStore()
+	now := time.Now()
+	identity := models.SocketIdentity{UserID: "u", CompanyID: "c", AccessProfile: "client", ProjectID: "p", AuthExpiresAt: now.Add(time.Hour)}
+	token, _, _ := store.IssueTicket(context.Background(), identity, now.Add(time.Hour), repository.TicketPolicy{}, now)
+	handler := NewSocketHandler(store, nil, nil, SocketOptions{AllowedOrigins: []string{"https://dev2.solutions"}})
+	server := httptest.NewServer(http.HandlerFunc(handler.Connect))
+	defer server.Close()
+	dialer := websocket.Dialer{Subprotocols: []string{baseProtocol, ticketProtocolPrefix + token}}
+	conn, _, err := dialer.Dial("ws"+strings.TrimPrefix(server.URL, "http")+"/chat/ws", http.Header{"Origin": []string{"https://dev2.solutions"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn.Close()
+	var ready models.SocketServerEvent
+	_ = conn.ReadJSON(&ready)
+	_ = conn.WriteMessage(websocket.TextMessage, []byte(`{"type":`))
+	_, payload, err := conn.ReadMessage()
+	var closeErr *websocket.CloseError
+	if !errors.As(err, &closeErr) || closeErr.Code != websocket.ClosePolicyViolation || len(payload) != 0 {
+		t.Fatalf("malformed frame received response loop: payload=%q err=%v", payload, err)
+	}
+}
+
+func TestHandshakeLimiterRunsBeforeMongo(t *testing.T) {
+	store := newMemorySocketStore()
+	now := time.Now()
+	identity := models.SocketIdentity{UserID: "u", CompanyID: "c", AccessProfile: "client", ProjectID: "p"}
+	token, _, _ := store.IssueTicket(context.Background(), identity, now.Add(time.Hour), repository.TicketPolicy{}, now)
+	handler := NewSocketHandler(store, nil, nil, SocketOptions{
+		AllowedOrigins: []string{"https://dev2.solutions"}, HandshakeBurst: 2, HandshakeRate: 1,
+	})
+	var lastStatus int
+	for i := 0; i < 3; i++ {
+		request := httptest.NewRequest(http.MethodGet, "/chat/ws", nil)
+		request.RemoteAddr = "192.0.2.1:1234"
+		request.Header.Set("Origin", "https://dev2.solutions")
+		request.Header.Set("Sec-WebSocket-Protocol", baseProtocol+", "+ticketProtocolPrefix+token)
+		response := httptest.NewRecorder()
+		handler.Connect(response, request)
+		lastStatus = response.Code
+	}
+	if lastStatus != http.StatusTooManyRequests || store.consumeCalls != 2 {
+		t.Fatalf("handshake limiter did not precede Mongo: status=%d consumes=%d", lastStatus, store.consumeCalls)
 	}
 }

@@ -36,6 +36,7 @@ type SocketTicket struct {
 // SocketServerEvent is the durable server-to-browser WebSocket envelope.
 type SocketServerEvent struct {
 	Seq       int64          `bson:"seq" json:"seq"`
+	Ephemeral bool           `bson:"-" json:"ephemeral,omitempty"`
 	Type      string         `bson:"type" json:"type"`
 	RequestID string         `bson:"requestId,omitempty" json:"requestId,omitempty"`
 	SessionID string         `bson:"sessionId,omitempty" json:"sessionId,omitempty"`
@@ -89,6 +90,8 @@ type SocketReplay struct {
 	EarliestAvailableSeq int64
 	LatestSeq            int64
 	GapDetected          bool
+	Truncated            bool
+	NextSeq              int64
 }
 
 type SocketLease struct {

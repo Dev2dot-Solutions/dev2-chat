@@ -18,15 +18,25 @@ import (
 )
 
 type AgentHandler struct {
-	sessionRepo   *repository.SessionRepo
-	messageRepo   *repository.MessageRepo
-	approvalRepo  *repository.ApprovalRepo
-	knowledgeRepo *repository.KnowledgeRepo
-	llmClient     *llm.Client
-	natsClient    *nats.Client
-	toolExecutor  *tools.Executor
-	llmModel      string
-	llmProvider   string
+	sessionRepo           *repository.SessionRepo
+	messageRepo           *repository.MessageRepo
+	approvalRepo          *repository.ApprovalRepo
+	knowledgeRepo         *repository.KnowledgeRepo
+	llmClient             *llm.Client
+	natsClient            *nats.Client
+	toolExecutor          *tools.Executor
+	llmModel              string
+	llmProvider           string
+	legacyActiveTransport bool
+	legacyDeveloperMaxAge time.Duration
+}
+
+func (h *AgentHandler) SetLegacyActiveTransportEnabled(enabled bool) {
+	h.legacyActiveTransport = enabled
+}
+
+func (h *AgentHandler) SetLegacyDeveloperMaxAge(maxAge time.Duration) {
+	h.legacyDeveloperMaxAge = maxAge
 }
 
 type agentResult struct {
@@ -80,6 +90,10 @@ func (h *AgentHandler) Routes(r chi.Router) {
 }
 
 func (h *AgentHandler) Ask(w http.ResponseWriter, r *http.Request) {
+	if !h.legacyActiveTransport {
+		respondError(w, http.StatusGone, "legacy active chat transport is disabled; use WebSocket")
+		return
+	}
 	var req models.ChatRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		respondError(w, http.StatusBadRequest, "invalid request body")
@@ -91,6 +105,10 @@ func (h *AgentHandler) Ask(w http.ResponseWriter, r *http.Request) {
 	}
 	if req.CompanyID == "" || req.Question == "" {
 		respondError(w, http.StatusBadRequest, "companyId and question are required")
+		return
+	}
+	if status, errMsg := h.validateLegacyRequestAuthorization(r, req); errMsg != "" {
+		respondError(w, status, errMsg)
 		return
 	}
 
@@ -121,6 +139,55 @@ func (h *AgentHandler) Ask(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
+func (h *AgentHandler) validateLegacyRequestAuthorization(r *http.Request, req models.ChatRequest) (int, string) {
+	if req.ConversationID != "" {
+		session, err := h.sessionRepo.GetByID(r.Context(), req.ConversationID)
+		if err != nil {
+			return http.StatusInternalServerError, "failed to load session"
+		}
+		if session != nil {
+			return h.validateCurrentSessionAuthorization(r, session, h.legacyDeveloperMaxAge)
+		}
+	}
+	profile := models.NormalizeAccessProfile(req.AccessProfile)
+	return h.validateCurrentSessionAuthorization(r, &models.ChatSession{
+		CompanyID: req.CompanyID, UserID: GetUserID(r), AccessProfile: profile, ProjectID: req.ProjectID,
+	}, h.legacyDeveloperMaxAge)
+}
+
+func (h *AgentHandler) validateCurrentSessionAuthorization(r *http.Request, session *models.ChatSession, developerMaxAge time.Duration) (int, string) {
+	if session == nil || session.ProjectID == "" {
+		return http.StatusForbidden, "project-bound session is required"
+	}
+	if companyID := GetCompanyID(r); companyID != "" && companyID != session.CompanyID {
+		return http.StatusForbidden, "session belongs to a different company"
+	}
+	profile := models.NormalizeAccessProfile(session.AccessProfile)
+	if profile == models.AccessProfileDeveloper {
+		if !GetIsAdmin(r) {
+			return http.StatusForbidden, "developer sessions require an admin user"
+		}
+		issuedAt := GetAuthIssuedAt(r)
+		if developerMaxAge > 0 && (issuedAt.IsZero() || time.Since(issuedAt) > developerMaxAge) {
+			return http.StatusUnauthorized, "developer authentication must be refreshed"
+		}
+	}
+	project, err := h.lookupProjectFresh(r, session.CompanyID, session.ProjectID)
+	if err != nil {
+		return http.StatusServiceUnavailable, "project authorization unavailable"
+	}
+	if project == nil || (project.CompanyID != "" && project.CompanyID != session.CompanyID) {
+		return http.StatusForbidden, "project authorization revoked"
+	}
+	if profile == models.AccessProfileClient && !project.Visibility.Client {
+		return http.StatusForbidden, "client project access revoked"
+	}
+	if profile == models.AccessProfileDeveloper && !project.Visibility.Developer {
+		return http.StatusForbidden, "developer project access revoked"
+	}
+	return 0, ""
+}
+
 // prepareAgentRequest is shared by REST/SSE and WebSocket transports. It owns
 // all session creation, identity binding, project visibility, history and
 // prompt preparation so transport handlers cannot fork chat business logic.
@@ -146,7 +213,7 @@ func (h *AgentHandler) prepareAgentRequest(r *http.Request, req models.ChatReque
 		"When you need more information, use the available tools to search knowledge, " +
 		"look up tickets, or interact with the Project Tracker." + knowledgeContext
 	history, _ := h.messageRepo.ListBySession(r.Context(), session.ID, 10)
-	h.saveMessage(r, session.ID, "user", req.Question, "", "")
+	h.saveMessage(r, session.ID, req.RequestID, "user", req.Question, "", "")
 
 	prepared := &preparedAgentRequest{
 		session: session, project: project, req: req, profile: profile,
@@ -170,6 +237,9 @@ func (h *AgentHandler) completeAgentRequest(r *http.Request, prepared *preparedA
 			onProgress(event)
 		}
 	})
+	if prepared.profile != models.AccessProfileDeveloper {
+		result.pendingApprovals = nil
+	}
 	toolTrace := models.NormalizeToolTrace(progress)
 	if !result.cancelled {
 		h.finishAsk(r, prepared.session, prepared.req, prepared.actorUserID, result, toolTrace)
@@ -400,7 +470,7 @@ func (h *AgentHandler) processLLMResponse(r *http.Request, session *models.ChatS
 
 	if len(llmResp.ToolCalls) > 0 {
 		assistantMsg := &models.ChatMessage{
-			SessionID: session.ID, Role: "assistant", Content: llmResp.Content,
+			SessionID: session.ID, RequestID: req.RequestID, Role: "assistant", Content: llmResp.Content,
 		}
 		for _, tc := range llmResp.ToolCalls {
 			assistantMsg.ToolCalls = append(assistantMsg.ToolCalls, models.ToolCallResult{
@@ -688,6 +758,7 @@ func (h *AgentHandler) finishAsk(r *http.Request, session *models.ChatSession, r
 	h.recordPendingApprovals(r, session, actorUserID, result.pendingApprovals)
 	assistantMsg := &models.ChatMessage{
 		SessionID:        session.ID,
+		RequestID:        req.RequestID,
 		Role:             "assistant",
 		Content:          result.answer,
 		PendingApprovals: result.pendingApprovals,
@@ -707,9 +778,10 @@ func (h *AgentHandler) finishAsk(r *http.Request, session *models.ChatSession, r
 	}
 }
 
-func (h *AgentHandler) saveMessage(r *http.Request, sessionID, role, content, toolCallID, name string) {
+func (h *AgentHandler) saveMessage(r *http.Request, sessionID, requestID, role, content, toolCallID, name string) {
 	msg := &models.ChatMessage{
 		SessionID:  sessionID,
+		RequestID:  requestID,
 		Role:       role,
 		Content:    content,
 		ToolCallID: toolCallID,

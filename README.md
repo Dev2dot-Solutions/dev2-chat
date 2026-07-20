@@ -24,8 +24,8 @@ User ──HTTP/WebSocket──▶ dev2-chat ──NATS──▶ dev2-llm-servic
 | Method | Path | Description |
 |--------|------|-------------|
 | GET | /health | Health check |
-| POST | /agent/ask | Send question, get answer (context-aware Q&A) |
-| POST | /chat | Legacy endpoint (creates sessions) |
+| POST | /agent/ask | Legacy REST/SSE generation (`410` by default) |
+| POST | /chat | Legacy active endpoint (`410` by default) |
 | POST | /chat/socket-ticket | Issue a 30-second, one-use WebSocket ticket |
 | GET | /chat/ws | Primary active-chat WebSocket transport (subprotocol ticket) |
 | GET | /chat/sessions | List chat sessions |
@@ -33,8 +33,11 @@ User ──HTTP/WebSocket──▶ dev2-chat ──NATS──▶ dev2-llm-servic
 | GET | /settings/llm?company_id= | Get LLM config |
 | GET | /settings/pt?company_id= | Get PT config |
 
-`POST /agent/ask?stream=true` (SSE) remains available as a **deprecated
-compatibility fallback**. Durable session/history APIs remain REST endpoints.
+`POST /agent/ask`, its deprecated SSE mode, `POST /chat`, and REST approval
+decisions are disabled with `410 Gone` by default in production. Set
+`CHAT_LEGACY_ACTIVE_TRANSPORT_ENABLED=true` only in development; production
+configuration rejects attempts to enable it. Durable session/history APIs
+remain REST endpoints.
 
 ## WebSocket chat
 
@@ -80,7 +83,8 @@ Client types are `chat.send`, `approval.decide`, `generation.cancel`,
 `session.resume`, and `ping`. `chat.send` and `approval.decide` require both
 `requestId` and `idempotencyKey`. The profile/project must equal the ticket
 scope. `generation.cancel` targets an active `requestId`; cancellation flows
-through the existing request context and NATS cancellation protocol.
+through the existing request context and NATS cancellation protocol. Approval
+messages and actionable approval cards are developer-admin only.
 
 Every server event has the following shape:
 
@@ -95,6 +99,11 @@ Every server event has the following shape:
 }
 ```
 
+Non-durable control responses and routine errors carry `"seq":0` and
+`"ephemeral":true`; clients must never compare those events with a durable
+session cursor. Persisted user and assistant messages include the originating
+`requestId`, allowing REST hydration to reconcile optimistic UI rows.
+
 Server types are `connection.ready`, `chat.accepted`, `trace`,
 `content.delta`, `chat.meta`, `approval.requested`, `approval.resolved`,
 `generation.completed`, `generation.cancelled`, `replay.completed`, `error`,
@@ -106,9 +115,10 @@ when available.
 
 `connection.ready.data.authExpiresAt` is the effective connection expiry. A
 socket closes with code `4401` at the earliest of JWT expiry and its configured
-maximum lifetime. Developer sockets have a shorter default lifetime and
-project visibility is fetched without cache before developer sends and all
-approval decisions. Developer ticketing also requires `iat` and limits sockets
+maximum lifetime. Project/company visibility is fetched without cache before
+every send, resume, and receipt replay for both profiles. Developer sockets
+have a shorter default lifetime and stricter admin checks. Developer ticketing
+also requires `iat` and limits sockets
 to five minutes from that issue time, forcing a fresh access token. There is
 currently no live Authentik group-membership API in this service, so developer
 admin membership remains the signed JWT snapshot within that bounded window.
@@ -121,14 +131,19 @@ The server uses one writer goroutine per connection, a bounded event queue,
 second idle deadline renewed by pong/read activity. Retryable capacity and
 backpressure close with `1013`; auth, authorization, and rate-limit closures
 use `4401`, `4403`, and `4429` respectively. Ticket issuance, connections and
-active generations have cross-instance MongoDB limits/leases. Application
-pings bypass action slots, rate tokens, sequence storage, and replay storage.
+active generations have cross-instance MongoDB limits/leases. Every inbound
+data frame—including app pings and unsupported messages—consumes both a
+per-socket token and distributed user/company/IP rate capacity. Pings still
+bypass expensive action slots, sequence storage, and replay storage. Malformed
+frames close the connection without creating an error-response loop.
 
 Replay is intentionally metadata-only. Answer deltas, full `chat.meta`, raw
 tool output, approval previews/results, routine errors and ping/pong events are
-not stored. Safe trace/control DTOs are capped at 4 KiB. `replay.completed`
-includes `earliestAvailableSeq`, `latestSeq`, and `gapDetected`; clients must
-hydrate durable message history over REST when a gap is reported. Sequence
+not stored. Safe trace/control DTOs are capped at 4 KiB. Each replay page is at
+most 100 events and 256 KiB and is further bounded by available connection
+queue capacity. `replay.completed` includes `earliestAvailableSeq`,
+`latestSeq`, `gapDetected`, `truncated`, and `nextSeq`; clients must hydrate
+durable message history over REST when a gap/truncation is reported. Sequence
 counters do not expire, so sequence numbers never reset after retention.
 
 MongoDB storage used by this transport:
@@ -141,7 +156,7 @@ MongoDB storage used by this transport:
 - `chat_socket_sequences`: durable cross-instance sequence counters (no TTL).
 - `chat_socket_receipts`: hashed user/company/idempotency key receipts and
   profile/project/session/action/payload binding plus terminal state; TTL index.
-- `chat_socket_rate_limits`: ticket issue minute buckets with TTL.
+- `chat_socket_rate_limits`: ticket and distributed frame-rate minute buckets with TTL.
 - `chat_socket_leases`: global/company/user/IP connection and active-generation
   slots, renewed while active and TTL-reaped after crashes.
 
@@ -150,6 +165,13 @@ MongoDB storage used by this transport:
 The proxy in front of `/chat/ws` must use HTTP/1.1 and forward Upgrade headers:
 
 ```nginx
+# http context
+limit_req_zone $binary_remote_addr zone=chat_ws_handshake:10m rate=30r/m;
+limit_conn_zone $binary_remote_addr zone=chat_ws_connections:10m;
+
+# /chat/ws location
+limit_req zone=chat_ws_handshake burst=10 nodelay;
+limit_conn chat_ws_connections 20;
 proxy_http_version 1.1;
 proxy_set_header Upgrade $http_upgrade;
 proxy_set_header Connection "upgrade";
@@ -160,8 +182,10 @@ proxy_read_timeout 75s;
 Do not log `Sec-WebSocket-Protocol` for `/chat/ws`: it temporarily carries the
 one-use credential. Apply proxy handshake/IP connection limits at or below the
 backend limits for early rejection, but do not strip either offered protocol.
-Set `CHAT_SOCKET_TRUSTED_PROXY_CIDRS` to the proxy's actual source network;
-forwarded client IP headers are ignored from every other peer.
+Set `CHAT_SOCKET_TRUSTED_PROXY_CIDRS` to only the proxy's actual source
+host/network; forwarded client IP headers are ignored from every other peer.
+Production startup fails when `CHAT_SOCKET_REQUIRE_TRUSTED_PROXY=true` and this
+list is empty. Do not substitute a broad private-network CIDR.
 
 ## POST /agent/ask
 
@@ -217,11 +241,13 @@ forwarded client IP headers are ignored from every other peer.
 | TICKETS_SVC_URL | http://dev2-tickets:8080 | dev2-tickets HTTP URL |
 | PT_SVC_URL | https://app.project-tracker.ai/api | Project Tracker API |
 | ENVIRONMENT | production | `development` adds localhost to defaults |
+| CHAT_LEGACY_ACTIVE_TRANSPORT_ENABLED | false in production | Enable deprecated transports in development only |
 | AUTHENTIK_ISSUER | — | Required JWT issuer |
 | AUTHENTIK_AUDIENCE | — | Required JWT audience |
 | CHAT_ALLOWED_ORIGINS | https://dev2.solutions | REST/SSE CORS origins |
 | CHAT_SOCKET_ALLOWED_ORIGINS | https://dev2.solutions | Exact WebSocket origins (no wildcards) |
 | CHAT_SOCKET_TRUSTED_PROXY_CIDRS | empty | Proxy CIDRs trusted for forwarded client IP |
+| CHAT_SOCKET_REQUIRE_TRUSTED_PROXY | true in production | Fail startup without a trusted proxy CIDR |
 | CHAT_SOCKET_SEND_QUEUE | 128 | Per-connection outbound event capacity |
 | CHAT_SOCKET_READ_LIMIT_BYTES | 65536 | Maximum client message size |
 | CHAT_SOCKET_PING_INTERVAL | 25s | WebSocket control-ping interval |
@@ -239,8 +265,13 @@ forwarded client IP headers are ignored from every other peer.
 | CHAT_SOCKET_GENERATIONS_PER_COMPANY | 20 | Company active generations |
 | CHAT_SOCKET_GENERATIONS_PER_USER | 2 | User active generations |
 | CHAT_SOCKET_GENERATION_LEASE_TTL | 3m | Crash-recovery generation lease TTL |
-| CHAT_SOCKET_MESSAGES_PER_MINUTE | 60 | Per-socket action refill rate |
-| CHAT_SOCKET_MESSAGE_BURST | 20 | Per-socket action burst |
+| CHAT_SOCKET_MESSAGES_PER_MINUTE | 60 | Per-socket frame refill rate |
+| CHAT_SOCKET_MESSAGE_BURST | 20 | Per-socket frame burst |
+| CHAT_SOCKET_MESSAGES_PER_MINUTE_PER_USER | 120 | Distributed user frame limit |
+| CHAT_SOCKET_MESSAGES_PER_MINUTE_PER_COMPANY | 1200 | Distributed company frame limit |
+| CHAT_SOCKET_MESSAGES_PER_MINUTE_PER_IP | 600 | Distributed client-IP frame limit |
+| CHAT_SOCKET_HANDSHAKE_RATE_PER_MINUTE | 30 | Pre-Mongo per-process/IP handshake refill |
+| CHAT_SOCKET_HANDSHAKE_BURST | 10 | Pre-Mongo per-process/IP handshake burst |
 
 ## Dependencies
 

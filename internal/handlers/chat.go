@@ -14,10 +14,20 @@ import (
 )
 
 type ChatHandler struct {
-	sessionRepo  *repository.SessionRepo
-	messageRepo  *repository.MessageRepo
-	approvalRepo *repository.ApprovalRepo
-	natsClient   *nats.Client
+	sessionRepo           *repository.SessionRepo
+	messageRepo           *repository.MessageRepo
+	approvalRepo          *repository.ApprovalRepo
+	natsClient            *nats.Client
+	legacyActiveTransport bool
+	agentHandler          *AgentHandler
+}
+
+func (h *ChatHandler) SetLegacyActiveTransportEnabled(enabled bool) {
+	h.legacyActiveTransport = enabled
+}
+
+func (h *ChatHandler) SetAgentHandler(agent *AgentHandler) {
+	h.agentHandler = agent
 }
 
 func NewChatHandler(sr *repository.SessionRepo, mr *repository.MessageRepo, ar *repository.ApprovalRepo, nc *nats.Client) *ChatHandler {
@@ -35,6 +45,10 @@ func (h *ChatHandler) Routes(r chi.Router) {
 
 // SendMessage handles POST /chat (alias kept for compatibility, logic is in AgentHandler.Ask)
 func (h *ChatHandler) SendMessage(w http.ResponseWriter, r *http.Request) {
+	if !h.legacyActiveTransport {
+		respondError(w, http.StatusGone, "legacy active chat transport is disabled; use WebSocket")
+		return
+	}
 	// Chat messages are now handled by the /agent/ask endpoint
 	// This is a lightweight wrapper that creates a session if needed
 	respondJSON(w, http.StatusOK, map[string]string{
@@ -127,11 +141,20 @@ func (h *ChatHandler) GetSession(w http.ResponseWriter, r *http.Request) {
 		respondError(w, http.StatusInternalServerError, "failed to get messages")
 		return
 	}
+	if models.NormalizeAccessProfile(session.AccessProfile) == models.AccessProfileClient {
+		stripActionableApprovals(messages)
+	}
 
 	respondJSON(w, http.StatusOK, map[string]any{
 		"session":  session,
 		"messages": messages,
 	})
+}
+
+func stripActionableApprovals(messages []models.ChatMessage) {
+	for i := range messages {
+		messages[i].PendingApprovals = nil
+	}
 }
 
 // DecideApproval handles POST /chat/approvals/{approvalId} (DEV2-108).
@@ -143,6 +166,10 @@ func (h *ChatHandler) GetSession(w http.ResponseWriter, r *http.Request) {
 // and userId forwarded on tool.approve come from the resolved session —
 // never from the request body.
 func (h *ChatHandler) DecideApproval(w http.ResponseWriter, r *http.Request) {
+	if !h.legacyActiveTransport {
+		respondError(w, http.StatusGone, "legacy approval transport is disabled; use WebSocket")
+		return
+	}
 	approvalID := chi.URLParam(r, "approvalId")
 	if approvalID == "" {
 		respondError(w, http.StatusBadRequest, "missing approval id")
@@ -189,12 +216,12 @@ func (h *ChatHandler) decideApproval(r *http.Request, approvalID, decision strin
 		return http.StatusNotFound, nil, "approval not found"
 	}
 
-	if !GetIsAdmin(r) {
-		if models.NormalizeAccessProfile(session.AccessProfile) == models.AccessProfileDeveloper {
-			return http.StatusForbidden, nil, "developer sessions require an admin user"
-		}
-		if uid := GetUserID(r); uid == "" || session.UserID == "" || session.UserID != uid {
-			return http.StatusForbidden, nil, "session belongs to a different user"
+	if errMsg := approvalAuthorizationError(session, GetIsAdmin(r)); errMsg != "" {
+		return http.StatusForbidden, nil, errMsg
+	}
+	if h.legacyActiveTransport && h.agentHandler != nil {
+		if status, errMsg := h.agentHandler.validateCurrentSessionAuthorization(r, session, h.agentHandler.legacyDeveloperMaxAge); errMsg != "" {
+			return status, nil, errMsg
 		}
 	}
 	if companyID := GetCompanyID(r); companyID != "" && session.CompanyID != companyID {
@@ -259,6 +286,16 @@ func (h *ChatHandler) decideApproval(r *http.Request, approvalID, decision strin
 		log.Printf("[chat] tool.approve unexpected status for %s: %q (error=%s)", approvalID, toolResp.Status, toolResp.Error)
 		return http.StatusBadGateway, nil, "approval decision failed"
 	}
+}
+
+func approvalAuthorizationError(session *models.ChatSession, isAdmin bool) string {
+	if session == nil || models.NormalizeAccessProfile(session.AccessProfile) != models.AccessProfileDeveloper {
+		return "approvals require a developer session"
+	}
+	if !isAdmin {
+		return "approvals require an admin user"
+	}
+	return ""
 }
 
 // appendDecisionMessage records the outcome in the conversation so the

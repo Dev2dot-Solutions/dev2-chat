@@ -23,6 +23,8 @@ const (
 	socketHistoryTTL     = 24 * time.Hour
 	socketHistoryCap     = int64(1000)
 	socketReplayMaxBytes = 4096
+	replayPageMaxEvents  = 100
+	replayPageMaxBytes   = 256 << 10
 	socketCleanupTimeout = 5 * time.Second
 )
 
@@ -49,6 +51,12 @@ type GenerationPolicy struct {
 	CompanyLimit int
 	UserLimit    int
 	LeaseTTL     time.Duration
+}
+
+type MessageRatePolicy struct {
+	UserPerMinute    int
+	CompanyPerMinute int
+	IPPerMinute      int
 }
 
 type SocketRepo struct {
@@ -238,6 +246,24 @@ func (r *SocketRepo) ReleaseLease(ctx context.Context, lease *models.SocketLease
 	_, _ = r.leases.DeleteMany(ctx, bson.M{"_id": bson.M{"$in": lease.LeaseIDs}, "connectionId": lease.ConnectionID})
 }
 
+func (r *SocketRepo) TakeMessageRate(ctx context.Context, identity models.SocketIdentity, ip string, policy MessageRatePolicy, now time.Time) error {
+	dimensions := []struct {
+		kind  string
+		scope string
+		limit int
+	}{
+		{"message-user", identity.CompanyID + "\x00" + identity.UserID, policy.UserPerMinute},
+		{"message-company", identity.CompanyID, policy.CompanyPerMinute},
+		{"message-ip", ip, policy.IPPerMinute},
+	}
+	for _, dimension := range dimensions {
+		if err := r.takeRate(ctx, dimension.kind, dimension.scope, dimension.limit, time.Minute, now); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
 func (r *SocketRepo) RecordEvent(ctx context.Context, identity models.SocketIdentity, event models.SocketServerEvent) (*models.SocketServerEvent, bool, error) {
 	scope := event.SessionID
 	if scope == "" {
@@ -306,15 +332,37 @@ func (r *SocketRepo) ReplayEvents(ctx context.Context, identity models.SocketIde
 	}
 	cursor, err := r.events.Find(ctx, bson.M{
 		"companyId": identity.CompanyID, "userId": identity.UserID, "sessionId": sessionID, "seq": bson.M{"$gt": afterSeq},
-	}, options.Find().SetSort(bson.D{{Key: "seq", Value: 1}}).SetLimit(socketHistoryCap))
+	}, options.Find().SetSort(bson.D{{Key: "seq", Value: 1}}).SetLimit(replayPageMaxEvents+1))
 	if err != nil {
 		return nil, fmt.Errorf("find socket replay: %w", err)
 	}
 	defer cursor.Close(ctx)
-	if err := cursor.All(ctx, &window.Events); err != nil {
-		return nil, fmt.Errorf("decode socket replay: %w", err)
+	window.NextSeq = afterSeq
+	aggregateBytes := 0
+	for cursor.Next(ctx) {
+		var event models.SocketServerEvent
+		if err := cursor.Decode(&event); err != nil {
+			return nil, fmt.Errorf("decode socket replay: %w", err)
+		}
+		payload, err := json.Marshal(event)
+		if err != nil {
+			return nil, fmt.Errorf("size socket replay: %w", err)
+		}
+		if len(window.Events) >= replayPageMaxEvents || aggregateBytes+len(payload) > replayPageMaxBytes {
+			window.Truncated = true
+			break
+		}
+		window.Events = append(window.Events, event)
+		aggregateBytes += len(payload)
+		window.NextSeq = event.Seq
+	}
+	if err := cursor.Err(); err != nil {
+		return nil, fmt.Errorf("iterate socket replay: %w", err)
 	}
 	window.GapDetected = detectReplayGap(window.Events, afterSeq, window.EarliestAvailableSeq, window.LatestSeq)
+	if window.Truncated {
+		window.GapDetected = true
+	}
 	return window, nil
 }
 
@@ -429,6 +477,9 @@ func (r *SocketRepo) acquireLeaseSlot(ctx context.Context, dimension, connection
 func safeReplayEvent(event models.SocketServerEvent) (models.SocketServerEvent, bool) {
 	safe := event
 	safe.Data = map[string]any{}
+	if event.Ephemeral || event.Seq == 0 {
+		return safe, false
+	}
 	switch event.Type {
 	case "chat.accepted":
 		safe.Data["accepted"] = true

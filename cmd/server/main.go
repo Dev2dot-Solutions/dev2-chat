@@ -55,6 +55,7 @@ func main() {
 			"user_id":         "userId",
 			"session_id":      "sessionId",
 			"conversation_id": "conversationId",
+			"request_id":      "requestId",
 			"access_profile":  "accessProfile",
 			"project_id":      "projectId",
 			"token_count":     "tokenCount",
@@ -119,6 +120,10 @@ func main() {
 		llmClient, natsClient, toolExecutor,
 		cfg.LLMModel, cfg.LLMProvider,
 	)
+	chatHandler.SetLegacyActiveTransportEnabled(cfg.LegacyActiveTransport)
+	agentHandler.SetLegacyActiveTransportEnabled(cfg.LegacyActiveTransport)
+	agentHandler.SetLegacyDeveloperMaxAge(cfg.SocketDeveloperMaxLifetime)
+	chatHandler.SetAgentHandler(agentHandler)
 	settingsHandler := handlers.NewSettingsHandler(settingsRepo)
 	socketHandler := handlers.NewSocketHandler(socketRepo, agentHandler, chatHandler, handlers.SocketOptions{
 		AllowedOrigins: cfg.SocketAllowedOrigins, TrustedProxyCIDRs: cfg.SocketTrustedProxyCIDRs,
@@ -135,6 +140,10 @@ func main() {
 			CompanyLimit: cfg.SocketGenerationsCompany, UserLimit: cfg.SocketGenerationsUser, LeaseTTL: cfg.SocketGenerationLeaseTTL,
 		},
 		MessagesPerMinute: cfg.SocketMessagesPerMinute, MessageBurst: cfg.SocketMessageBurst,
+		MessageRatePolicy: repository.MessageRatePolicy{
+			UserPerMinute: cfg.SocketMessagesUser, CompanyPerMinute: cfg.SocketMessagesCompany, IPPerMinute: cfg.SocketMessagesIP,
+		},
+		HandshakeRate: cfg.SocketHandshakeRate, HandshakeBurst: cfg.SocketHandshakeBurst,
 	})
 
 	// Router

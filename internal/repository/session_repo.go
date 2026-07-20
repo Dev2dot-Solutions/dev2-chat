@@ -103,16 +103,7 @@ func (r *SessionRepo) BindLegacyProject(ctx context.Context, id, companyID, user
 // non-admin listing without an explicit profile filter) hides developer
 // sessions while keeping legacy (untagged) sessions visible.
 func (r *SessionRepo) ListByCompany(ctx context.Context, companyID, userID, accessProfile string, excludeDeveloper bool, limit, offset int) (*models.SessionListResponse, error) {
-	filter := bson.M{"companyId": companyID}
-	if userID != "" {
-		filter["userId"] = userID
-	}
-	switch {
-	case accessProfile != "":
-		filter["accessProfile"] = accessProfile
-	case excludeDeveloper:
-		filter["accessProfile"] = bson.M{"$ne": models.AccessProfileDeveloper}
-	}
+	filter := buildSessionListFilter(companyID, userID, accessProfile, excludeDeveloper)
 
 	total, err := r.coll.CountDocuments(ctx, filter)
 	if err != nil {
@@ -152,6 +143,26 @@ func (r *SessionRepo) ListByCompany(ctx context.Context, companyID, userID, acce
 	}
 
 	return &models.SessionListResponse{Sessions: items, Total: int(total)}, nil
+}
+
+func buildSessionListFilter(companyID, userID, accessProfile string, excludeDeveloper bool) bson.M {
+	filter := bson.M{"companyId": companyID}
+	if userID != "" {
+		filter["userId"] = userID
+	}
+	switch {
+	case accessProfile == models.AccessProfileClient:
+		filter["$or"] = bson.A{
+			bson.M{"accessProfile": models.AccessProfileClient},
+			bson.M{"accessProfile": ""},
+			bson.M{"accessProfile": bson.M{"$exists": false}},
+		}
+	case accessProfile != "":
+		filter["accessProfile"] = accessProfile
+	case excludeDeveloper:
+		filter["accessProfile"] = bson.M{"$ne": models.AccessProfileDeveloper}
+	}
+	return filter
 }
 
 func (r *SessionRepo) UpdateTitle(ctx context.Context, id, title string) error {
