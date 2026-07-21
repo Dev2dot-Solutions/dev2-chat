@@ -119,8 +119,8 @@ func main() {
 	r.Use(chimw.RealIP)
 	r.Use(chimw.Logger)
 	r.Use(chimw.Recoverer)
-	r.Use(chimw.Timeout(30 * time.Second))
 	r.Use(cors.Handler(cors.Options{
+		// Allow all origins — the frontend is served from a different domain.
 		AllowedOrigins:   []string{"*"},
 		AllowedMethods:   []string{"GET", "POST", "PATCH", "DELETE", "OPTIONS"},
 		AllowedHeaders:   []string{"Accept", "Authorization", "Content-Type"},
@@ -128,6 +128,17 @@ func main() {
 		AllowCredentials: true,
 		MaxAge:           300,
 	}))
+	// WebSocket-aware timeout: skip timeout on WS upgrade paths so SSE
+	// streams and chat connections aren't killed by the global timeout.
+	r.Use(func(next http.Handler) http.Handler {
+		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			if r.URL.Path == "/chat/ws" {
+				next.ServeHTTP(w, r)
+				return
+			}
+			chimw.Timeout(30*time.Second)(next).ServeHTTP(w, r)
+		})
+	})
 	r.Use(handlers.AuthMiddleware)
 
 	// Health
