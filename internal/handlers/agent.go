@@ -1,33 +1,60 @@
 package handlers
 
 import (
+	"context"
 	"encoding/json"
+	"fmt"
 	"log"
 	"net/http"
 	"strings"
+	"time"
 
 	"github.com/Dev2dot-Solutions/dev2-chat/internal/llm"
 	"github.com/Dev2dot-Solutions/dev2-chat/internal/models"
 	"github.com/Dev2dot-Solutions/dev2-chat/internal/nats"
 	"github.com/Dev2dot-Solutions/dev2-chat/internal/repository"
 	"github.com/Dev2dot-Solutions/dev2-chat/internal/tools"
-	"github.com/go-chi/chi/v5"
 )
 
 type AgentHandler struct {
-	sessionRepo    *repository.SessionRepo
-	messageRepo    *repository.MessageRepo
-	knowledgeRepo  *repository.KnowledgeRepo
-	llmClient      *llm.Client
-	natsClient     *nats.Client
-	toolExecutor   *tools.Executor
-	llmModel       string
-	llmProvider    string
+	sessionRepo   *repository.SessionRepo
+	messageRepo   *repository.MessageRepo
+	approvalRepo  *repository.ApprovalRepo
+	knowledgeRepo *repository.KnowledgeRepo
+	llmClient     *llm.Client
+	natsClient    *nats.Client
+	toolExecutor  *tools.Executor
+	llmModel      string
+	llmProvider   string
+}
+
+type agentResult struct {
+	answer           string
+	toolCalls        []models.ToolCallDisplay
+	pendingApprovals []models.PendingApproval
+	totalTokens      int
+	cancelled        bool
+}
+
+type preparedAgentRequest struct {
+	session     *models.ChatSession
+	project     *models.CompanyProject
+	req         models.ChatRequest
+	profile     string
+	actorUserID string
+	llmReq      *models.LLMRequest
+	sources     []models.Source
+}
+
+type completedAgentRequest struct {
+	result    agentResult
+	toolTrace []models.ToolTraceEvent
 }
 
 func NewAgentHandler(
 	sr *repository.SessionRepo,
 	mr *repository.MessageRepo,
+	ar *repository.ApprovalRepo,
 	kr *repository.KnowledgeRepo,
 	lc *llm.Client,
 	nc *nats.Client,
@@ -35,96 +62,223 @@ func NewAgentHandler(
 	llmModel, llmProvider string,
 ) *AgentHandler {
 	return &AgentHandler{
-		sessionRepo:    sr,
-		messageRepo:    mr,
-		knowledgeRepo:  kr,
-		llmClient:      lc,
-		natsClient:     nc,
-		toolExecutor:   te,
-		llmModel:       llmModel,
-		llmProvider:    llmProvider,
+		sessionRepo:   sr,
+		messageRepo:   mr,
+		approvalRepo:  ar,
+		knowledgeRepo: kr,
+		llmClient:     lc,
+		natsClient:    nc,
+		toolExecutor:  te,
+		llmModel:      llmModel,
+		llmProvider:   llmProvider,
 	}
 }
 
-func (h *AgentHandler) Routes(r chi.Router) {
-	r.Post("/agent/ask", h.Ask)
-}
-
-func (h *AgentHandler) Ask(w http.ResponseWriter, r *http.Request) {
-	var req models.ChatRequest
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		respondError(w, http.StatusBadRequest, "invalid request body")
-		return
+// prepareAgentRequest is shared by WebSocket generation handlers. It owns
+// all session creation, identity binding, project visibility, history and
+// prompt preparation so transport handlers cannot fork chat business logic.
+func (h *AgentHandler) prepareAgentRequest(r *http.Request, req models.ChatRequest) (*preparedAgentRequest, int, string) {
+	session, project, status, errMsg := h.resolveSession(r, req)
+	if errMsg != "" {
+		return nil, status, errMsg
 	}
-	if req.CompanyID == "" || req.Question == "" {
-		respondError(w, http.StatusBadRequest, "companyId and question are required")
-		return
+	profile := models.NormalizeAccessProfile(session.AccessProfile)
+	actorUserID := GetUserID(r)
+	if actorUserID == "" {
+		actorUserID = session.UserID
 	}
-
-	session, err := h.resolveSession(r, req)
-	if err != nil {
-		respondError(w, http.StatusInternalServerError, "failed to create session")
-		return
-	}
+	req.CompanyID = session.CompanyID
+	req.UserID = actorUserID
+	req.ConversationID = session.ID
+	req.ProjectID = session.ProjectID
+	req.AccessProfile = profile
 
 	knowledgeContext := h.searchKnowledge(r, req)
 	systemPrompt := "You are a helpful AI assistant for the Dev2Knowledge platform. " +
 		"Answer questions based on the knowledge context provided. " +
 		"When you need more information, use the available tools to search knowledge, " +
-		"look up tickets, or interact with the Project Tracker." +
-		knowledgeContext
-
+		"look up tickets, or interact with the Project Tracker." + knowledgeContext
 	history, _ := h.messageRepo.ListBySession(r.Context(), session.ID, 10)
+	h.saveMessage(r, session.ID, req.RequestID, "user", req.Question, "", "")
 
-	h.saveMessage(r, session.ID, "user", req.Question, "", "")
-
-	llmReq := h.buildLLMRequest(systemPrompt, history, req)
-	finalAnswer, toolCallResults := h.processLLMResponse(r, session, llmReq, req)
-
-	h.saveMessage(r, session.ID, "assistant", finalAnswer, "", "")
-
-	if llmResp, _ := h.callLLM(llmReq); llmResp != nil && llmResp.Usage != nil {
-		h.sessionRepo.UpdateTokenCount(r.Context(), session.ID, llmResp.Usage.TotalTokens)
+	prepared := &preparedAgentRequest{
+		session: session, project: project, req: req, profile: profile,
+		actorUserID: actorUserID,
+		llmReq:      h.buildLLMRequest(systemPrompt, history, req, profile, project),
 	}
-
-	go h.natsClient.PublishMessageSent(session.ID, req.CompanyID, req.UserID, "user", req.Question)
-	go h.natsClient.PublishMessageSent(session.ID, req.CompanyID, req.UserID, "assistant", finalAnswer)
-
-	var sources []models.Source
 	if knowledgeContext != "" {
-		sources = []models.Source{{Type: "knowledge_graph", Label: "Context from knowledge graph"}}
+		prepared.sources = []models.Source{{Type: "knowledge_graph", Label: "Context from knowledge graph"}}
 	}
-
-	respondJSON(w, http.StatusOK, models.ChatResponse{
-		Answer:         finalAnswer,
-		ConversationID: session.ID,
-		ToolCalls:      toolCallResults,
-		Sources:        sources,
-	})
+	return prepared, 0, ""
 }
 
-func (h *AgentHandler) resolveSession(r *http.Request, req models.ChatRequest) (*models.ChatSession, error) {
+func (h *AgentHandler) completeAgentRequest(r *http.Request, prepared *preparedAgentRequest, onProgress func(models.ToolTraceEvent)) completedAgentRequest {
+	var progress []models.ToolTraceEvent
+	result := h.processLLMResponse(r, prepared.session, prepared.llmReq, prepared.req, prepared.profile, prepared.project, func(event models.ToolTraceEvent) {
+		if !models.IsToolTraceEvent(event) {
+			return
+		}
+		progress = append(progress, event)
+		if onProgress != nil {
+			onProgress(event)
+		}
+	})
+	if prepared.profile != models.AccessProfileDeveloper {
+		result.pendingApprovals = nil
+	}
+	toolTrace := models.NormalizeToolTrace(progress)
+	if !result.cancelled {
+		h.finishAsk(r, prepared.session, prepared.req, prepared.actorUserID, result, toolTrace)
+	}
+	return completedAgentRequest{result: result, toolTrace: toolTrace}
+}
+
+// resolveSession loads or creates the chat session for a request and enforces
+// the access-profile authorization rules:
+//   - developer sessions require an admin user (JWT dev2-admins group or the
+//     service API key);
+//   - a project-bound session requires the project's visibility flag for the
+//     profile (visibility.client / visibility.developer);
+//   - an existing session must belong to the request's company, and a
+//     non-admin may only continue sessions they own.
+//
+// On failure it returns an HTTP status and message for the caller to send.
+func (h *AgentHandler) resolveSession(r *http.Request, req models.ChatRequest) (*models.ChatSession, *models.CompanyProject, int, string) {
+	isAdmin := GetIsAdmin(r)
+	authUserID := GetUserID(r)
+
 	if req.ConversationID != "" {
 		s, err := h.sessionRepo.GetByID(r.Context(), req.ConversationID)
-		if err == nil && s != nil {
-			return s, nil
+		if err != nil {
+			log.Printf("[agent] GetSession error: %v", err)
+			return nil, nil, http.StatusInternalServerError, "failed to load session"
 		}
+		if s != nil {
+			if s.CompanyID != req.CompanyID {
+				return nil, nil, http.StatusForbidden, "session belongs to a different company"
+			}
+			if models.NormalizeAccessProfile(s.AccessProfile) == models.AccessProfileDeveloper && !isAdmin {
+				return nil, nil, http.StatusForbidden, "developer sessions require an admin user"
+			}
+			if !isAdmin && authUserID != "" && s.UserID != "" && s.UserID != authUserID {
+				return nil, nil, http.StatusForbidden, "session belongs to a different user"
+			}
+			var project *models.CompanyProject
+			if s.ProjectID != "" {
+				// Best-effort: used for PT project key + workspace scoping.
+				if p, err := h.lookupProject(r, s.CompanyID, s.ProjectID); err == nil {
+					project = p
+				} else {
+					log.Printf("[agent] project lookup failed for session %s: %v", s.ID, err)
+				}
+			}
+			return s, project, 0, ""
+		}
+		// Unknown conversationId — fall through and create a new session
+		// (legacy behaviour for stale client-side IDs).
 	}
+
+	// New session — validate the requested profile and project binding.
+	profile := models.AccessProfileClient
+	if req.AccessProfile != "" {
+		if !models.IsValidAccessProfile(req.AccessProfile) {
+			return nil, nil, http.StatusBadRequest, "accessProfile must be \"client\" or \"developer\""
+		}
+		profile = req.AccessProfile
+	}
+	project, status, errMsg := h.validateNewSessionScope(r, req.CompanyID, profile, req.ProjectID)
+	if errMsg != "" {
+		return nil, nil, status, errMsg
+	}
+
+	userID := req.UserID
+	if authUserID != "" {
+		// Bind the session to the authenticated identity rather than trusting
+		// the client-supplied userId.
+		userID = authUserID
+	}
+
 	title := req.Question
 	if len(title) > 100 {
 		title = title[:100]
 	}
 	s, err := h.sessionRepo.Create(r.Context(), models.ChatSessionInput{
-		CompanyID: req.CompanyID,
-		UserID:    req.UserID,
-		Title:     title,
-		Model:     h.llmModel,
-		Provider:  h.llmProvider,
+		CompanyID:     req.CompanyID,
+		UserID:        userID,
+		Title:         title,
+		Model:         h.llmModel,
+		Provider:      h.llmProvider,
+		AccessProfile: profile,
+		ProjectID:     req.ProjectID,
 	})
-	if err == nil {
-		go h.natsClient.PublishSessionCreated(s)
+	if err != nil {
+		log.Printf("[agent] Create session error: %v", err)
+		return nil, nil, http.StatusInternalServerError, "failed to create session"
 	}
-	return s, err
+	go h.natsClient.PublishSessionCreated(s)
+	return s, project, 0, ""
+}
+
+// validateNewSessionScope is used both when creating a session and when
+// issuing a socket ticket, keeping profile/admin/project policy identical.
+func (h *AgentHandler) validateNewSessionScope(r *http.Request, companyID, profile, projectID string) (*models.CompanyProject, int, string) {
+	if !models.IsValidAccessProfile(profile) {
+		return nil, http.StatusBadRequest, "accessProfile must be \"client\" or \"developer\""
+	}
+	if profile == models.AccessProfileDeveloper && !GetIsAdmin(r) {
+		return nil, http.StatusForbidden, "developer profile requires an admin user"
+	}
+	if projectID == "" {
+		return nil, 0, ""
+	}
+	p, err := h.lookupProject(r, companyID, projectID)
+	if err != nil {
+		log.Printf("[agent] project lookup error: %v", err)
+		return nil, http.StatusBadGateway, "failed to resolve project"
+	}
+	if p == nil {
+		return nil, http.StatusBadRequest, "unknown projectId for this company"
+	}
+	if profile == models.AccessProfileClient && !p.Visibility.Client {
+		return nil, http.StatusForbidden, "project is not visible to client chat"
+	}
+	if profile == models.AccessProfileDeveloper && !p.Visibility.Developer {
+		return nil, http.StatusForbidden, "project is not visible to developer chat"
+	}
+	return p, 0, ""
+}
+
+// lookupProject resolves a Dev2Project via company.projects.get (cached).
+func (h *AgentHandler) lookupProject(r *http.Request, companyID, projectID string) (*models.CompanyProject, error) {
+	if h.natsClient == nil {
+		return nil, fmt.Errorf("project lookup unavailable")
+	}
+	projects, err := h.natsClient.RequestCompanyProjects(companyID)
+	if err != nil {
+		return nil, err
+	}
+	for i := range projects {
+		if projects[i].ID == projectID {
+			return &projects[i], nil
+		}
+	}
+	return nil, nil
+}
+
+func (h *AgentHandler) lookupProjectFresh(r *http.Request, companyID, projectID string) (*models.CompanyProject, error) {
+	if h.natsClient == nil {
+		return nil, fmt.Errorf("project lookup unavailable")
+	}
+	projects, err := h.natsClient.RequestCompanyProjectsFresh(companyID)
+	if err != nil {
+		return nil, err
+	}
+	for i := range projects {
+		if projects[i].ID == projectID {
+			return &projects[i], nil
+		}
+	}
+	return nil, nil
 }
 
 func (h *AgentHandler) searchKnowledge(r *http.Request, req models.ChatRequest) string {
@@ -151,11 +305,19 @@ func (h *AgentHandler) searchKnowledge(r *http.Request, req models.ChatRequest) 
 	return "\n\nRelevant knowledge context:\n" + strings.Join(entries, "\n")
 }
 
-func (h *AgentHandler) buildLLMRequest(systemPrompt string, history []models.ChatMessage, req models.ChatRequest) *models.LLMRequest {
+func (h *AgentHandler) buildLLMRequest(systemPrompt string, history []models.ChatMessage, req models.ChatRequest, profile string, project *models.CompanyProject) *models.LLMRequest {
 	llmReq := &models.LLMRequest{
-		Model:     h.llmModel,
-		MaxTokens: 4096,
-		Tools:     h.toolExecutor.ToolDefinitions(),
+		Model:              h.llmModel,
+		MaxTokens:          4096,
+		Tools:              h.toolExecutor.ToolDefinitions(profile),
+		AccessProfile:      profile,
+		SessionID:          req.ConversationID,
+		UserID:             req.UserID,
+		WorkspaceCompanyID: req.CompanyID,
+		WorkspaceProjectID: req.ProjectID,
+	}
+	if project != nil {
+		llmReq.WorkspacePTProjectKey = project.ProjectTrackerKey
 	}
 	llmReq.Messages = append(llmReq.Messages, models.LLMMessage{Role: "system", Content: systemPrompt})
 	for _, msg := range history {
@@ -170,19 +332,31 @@ func (h *AgentHandler) buildLLMRequest(systemPrompt string, history []models.Cha
 	return llmReq
 }
 
-func (h *AgentHandler) processLLMResponse(r *http.Request, session *models.ChatSession, llmReq *models.LLMRequest, req models.ChatRequest) (string, []models.ToolCallDisplay) {
-	llmResp, err := h.callLLM(llmReq)
+func (h *AgentHandler) processLLMResponse(r *http.Request, session *models.ChatSession, llmReq *models.LLMRequest, req models.ChatRequest, profile string, project *models.CompanyProject, onProgress func(models.ToolTraceEvent)) agentResult {
+	llmResp, err := h.callLLM(r.Context(), llmReq, onProgress)
 	if err != nil {
+		if r.Context().Err() != nil {
+			return agentResult{cancelled: true}
+		}
 		log.Printf("[agent] LLM call failed: %v", err)
-		return "AI service unavailable. Please try again.", nil
+		return agentResult{answer: "AI service unavailable. Please try again."}
+	}
+	if llmResp == nil {
+		return agentResult{answer: "AI service unavailable. Please try again."}
 	}
 
-	finalAnswer := llmResp.Content
-	var toolCallResults []models.ToolCallDisplay
+	result := agentResult{answer: llmResp.Content}
+	if llmResp.Usage != nil {
+		result.totalTokens = llmResp.Usage.TotalTokens
+	}
+
+	// Approval-gated tools executed inside dev2-llm-service report back as
+	// tool results with a pending_approval payload (DEV2-108).
+	result.pendingApprovals = parsePendingApprovals(llmResp.ToolResults)
 
 	if len(llmResp.ToolCalls) > 0 {
 		assistantMsg := &models.ChatMessage{
-			SessionID: session.ID, Role: "assistant", Content: llmResp.Content,
+			SessionID: session.ID, RequestID: req.RequestID, Role: "assistant", Content: llmResp.Content,
 		}
 		for _, tc := range llmResp.ToolCalls {
 			assistantMsg.ToolCalls = append(assistantMsg.ToolCalls, models.ToolCallResult{
@@ -191,40 +365,192 @@ func (h *AgentHandler) processLLMResponse(r *http.Request, session *models.ChatS
 		}
 		h.messageRepo.Create(r.Context(), assistantMsg)
 
+		execCtx := tools.ExecContext{
+			CompanyID:     req.CompanyID,
+			UserID:        req.UserID,
+			SessionID:     session.ID,
+			ProjectID:     session.ProjectID,
+			AccessProfile: profile,
+		}
+		if project != nil {
+			execCtx.PTProjectKey = project.ProjectTrackerKey
+		}
+
 		for _, tc := range llmResp.ToolCalls {
-			result := h.toolExecutor.Execute(r.Context(), tc, req.CompanyID, req.UserID)
-			toolCallResults = append(toolCallResults, models.ToolCallDisplay{Name: tc.Function.Name, Result: result})
+			toolResult := h.toolExecutor.Execute(r.Context(), tc, execCtx)
+			result.toolCalls = append(result.toolCalls, models.ToolCallDisplay{Name: tc.Function.Name, Result: toolResult})
 			llmReq.Messages = append(llmReq.Messages, models.LLMMessage{
-				Role: "tool", Content: result, ToolCallID: tc.ID, Name: tc.Function.Name,
+				Role: "tool", Content: toolResult, ToolCallID: tc.ID, Name: tc.Function.Name,
 			})
 		}
 
-		followUpResp, err := h.callLLM(llmReq)
-		if err == nil && followUpResp.Content != "" {
-			finalAnswer = followUpResp.Content
+		followUpResp, err := h.callLLM(r.Context(), llmReq, onProgress)
+		if err == nil && followUpResp != nil && followUpResp.Content != "" {
+			result.answer = followUpResp.Content
+		}
+		if err == nil && followUpResp != nil {
+			result.pendingApprovals = append(result.pendingApprovals, parsePendingApprovals(followUpResp.ToolResults)...)
+			if followUpResp.Usage != nil {
+				result.totalTokens += followUpResp.Usage.TotalTokens
+			}
 		}
 	}
 
-	return finalAnswer, toolCallResults
+	return result
 }
 
-func (h *AgentHandler) callLLM(req *models.LLMRequest) (*models.LLMResponse, error) {
+// parsePendingApprovals extracts approval requests from dev2-llm-service
+// tool results. Approval-gated tools return an Output payload shaped
+// {"status":"pending_approval","approvalId":...,"summary":...,"preview":...,
+// "expiresAt":...} (camelCase); anything else is ignored.
+func parsePendingApprovals(results []models.LLMToolResult) []models.PendingApproval {
+	var out []models.PendingApproval
+	for _, tr := range results {
+		if tr.Output == "" {
+			continue
+		}
+		var payload map[string]any
+		if err := json.Unmarshal([]byte(tr.Output), &payload); err != nil {
+			continue
+		}
+		if status, _ := payload["status"].(string); status != "pending_approval" {
+			continue
+		}
+		approvalID, _ := payload["approvalId"].(string)
+		if approvalID == "" {
+			continue
+		}
+		pa := models.PendingApproval{
+			ApprovalID: approvalID,
+			Tool:       tr.ToolName,
+			Status:     models.ApprovalStatusPending,
+		}
+		if t, _ := payload["tool"].(string); t != "" {
+			pa.Tool = t
+		}
+		pa.Summary, _ = payload["summary"].(string)
+		pa.Preview, _ = payload["preview"].(string)
+		if pa.Summary == "" {
+			pa.Summary = pa.Preview
+		}
+		if e, _ := payload["expiresAt"].(string); e != "" {
+			if ts, err := time.Parse(time.RFC3339, e); err == nil {
+				pa.ExpiresAt = ts
+			}
+		}
+		out = append(out, pa)
+	}
+	return out
+}
+
+// recordPendingApprovals persists the approvalId → session mapping used by
+// the decision endpoint to resolve ownership (DEV2-108). Best-effort: a
+// persistence failure is logged but does not fail the chat response.
+func (h *AgentHandler) recordPendingApprovals(r *http.Request, session *models.ChatSession, actorUserID string, approvals []models.PendingApproval) {
+	if h.approvalRepo == nil {
+		return
+	}
+	for _, pa := range approvals {
+		rec := &models.ApprovalRecord{
+			ID:        pa.ApprovalID,
+			SessionID: session.ID,
+			CompanyID: session.CompanyID,
+			UserID:    actorUserID,
+			Tool:      pa.Tool,
+			Summary:   pa.Summary,
+			Preview:   pa.Preview,
+			ExpiresAt: pa.ExpiresAt,
+		}
+		if err := h.approvalRepo.RecordPending(r.Context(), rec); err != nil {
+			log.Printf("[agent] Record approval %s error: %v", pa.ApprovalID, err)
+		}
+	}
+}
+
+func buildSocketMeta(sessionID string, result agentResult, toolTrace []models.ToolTraceEvent, sources []models.Source) models.ChatResponse {
+	return models.ChatResponse{
+		Answer:           result.answer,
+		ConversationID:   sessionID,
+		ToolCalls:        result.toolCalls,
+		ToolTrace:        toolTrace,
+		PendingApprovals: result.pendingApprovals,
+		Sources:          sources,
+	}
+}
+
+// chunkText splits s into rune chunks of at most size, breaking on
+// whitespace where possible.
+func chunkText(s string, size int) []string {
+	runes := []rune(s)
+	if len(runes) == 0 {
+		return []string{""}
+	}
+	var chunks []string
+	for len(runes) > 0 {
+		n := size
+		if n > len(runes) {
+			n = len(runes)
+		}
+		// Prefer breaking at a space near the chunk boundary.
+		if n < len(runes) {
+			for i := n - 1; i > n/2; i-- {
+				if runes[i] == ' ' || runes[i] == '\n' {
+					n = i + 1
+					break
+				}
+			}
+		}
+		chunks = append(chunks, string(runes[:n]))
+		runes = runes[n:]
+	}
+	return chunks
+}
+
+func (h *AgentHandler) callLLM(ctx context.Context, req *models.LLMRequest, onProgress func(models.ToolTraceEvent)) (*models.LLMResponse, error) {
 	if h.natsClient != nil {
-		resp, err := h.natsClient.RequestLLM(req)
+		resp, err := h.natsClient.RequestLLMWithProgress(ctx, req, onProgress)
 		if err == nil {
 			return resp, nil
 		}
 		log.Printf("[agent] NATS LLM failed, fallback to HTTP: %v", err)
+		if ctx.Err() != nil {
+			return nil, ctx.Err()
+		}
 	}
 	if h.llmClient != nil {
-		return h.llmClient.ChatCompletion(req)
+		return h.llmClient.ChatCompletionWithContext(ctx, req)
 	}
-	return nil, nil
+	return nil, fmt.Errorf("LLM service unavailable")
 }
 
-func (h *AgentHandler) saveMessage(r *http.Request, sessionID, role, content, toolCallID, name string) {
+func (h *AgentHandler) finishAsk(r *http.Request, session *models.ChatSession, req models.ChatRequest, actorUserID string, result agentResult, toolTrace []models.ToolTraceEvent) {
+	h.recordPendingApprovals(r, session, actorUserID, result.pendingApprovals)
+	assistantMsg := &models.ChatMessage{
+		SessionID:        session.ID,
+		RequestID:        req.RequestID,
+		Role:             "assistant",
+		Content:          result.answer,
+		PendingApprovals: result.pendingApprovals,
+		ToolTrace:        toolTrace,
+	}
+	if err := h.messageRepo.Create(r.Context(), assistantMsg); err != nil {
+		log.Printf("[agent] Save message error: %v", err)
+	}
+	if result.totalTokens > 0 {
+		if err := h.sessionRepo.UpdateTokenCount(r.Context(), session.ID, result.totalTokens); err != nil {
+			log.Printf("[agent] Update token count error: %v", err)
+		}
+	}
+	if h.natsClient != nil {
+		go h.natsClient.PublishMessageSent(session.ID, req.CompanyID, req.UserID, "user", req.Question)
+		go h.natsClient.PublishMessageSent(session.ID, req.CompanyID, req.UserID, "assistant", result.answer)
+	}
+}
+
+func (h *AgentHandler) saveMessage(r *http.Request, sessionID, requestID, role, content, toolCallID, name string) {
 	msg := &models.ChatMessage{
 		SessionID:  sessionID,
+		RequestID:  requestID,
 		Role:       role,
 		Content:    content,
 		ToolCallID: toolCallID,

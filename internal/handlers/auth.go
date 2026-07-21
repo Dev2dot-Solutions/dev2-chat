@@ -6,6 +6,7 @@ import (
 	"crypto/subtle"
 	"encoding/base64"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log"
 	"math/big"
@@ -15,18 +16,24 @@ import (
 	"sync"
 	"time"
 
+	"github.com/Dev2dot-Solutions/dev2-chat/internal/models"
 	"github.com/golang-jwt/jwt/v5"
+	"github.com/google/uuid"
 )
 
 // contextKey type to avoid collisions
 type contextKey string
 
 const (
-	ContextUserID    contextKey = "userId"
-	ContextCompanyID contextKey = "companyId"
-	ContextIsAdmin   contextKey = "isAdmin"
-	ContextUserEmail contextKey = "userEmail"
-	ContextUserName  contextKey = "userName"
+	ContextUserID      contextKey = "userId"
+	ContextCompanyID   contextKey = "companyId"
+	ContextIsAdmin     contextKey = "isAdmin"
+	ContextUserEmail   contextKey = "userEmail"
+	ContextUserName    contextKey = "userName"
+	ContextAuthExpires contextKey = "authExpiresAt"
+	ContextAuthIssued  contextKey = "authIssuedAt"
+	ContextAuthSource  contextKey = "authSource"
+	ContextPeerIP      contextKey = "peerIp"
 )
 
 // jwksCache holds the fetched JWKS keys with a TTL
@@ -37,20 +44,25 @@ var (
 )
 
 type jwkKey struct {
-	Kid string   `json:"kid"`
-	Kty string   `json:"kty"`
-	Alg string   `json:"alg"`
-	N   string   `json:"n"`
-	E   string   `json:"e"`
-	Use string   `json:"use"`
+	Kid string `json:"kid"`
+	Kty string `json:"kty"`
+	Alg string `json:"alg"`
+	N   string `json:"n"`
+	E   string `json:"e"`
+	Use string `json:"use"`
 }
 
 type jwksResponse struct {
 	Keys []jwkKey `json:"keys"`
 }
 
-func getJwksURL() string {
-	issuer := os.Getenv("AUTHENTIK_ISSUER")
+type AuthOptions struct {
+	Issuer             string
+	Audience           string
+	ServiceMaxLifetime time.Duration
+}
+
+func getJwksURL(issuer string) string {
 	if issuer == "" {
 		return ""
 	}
@@ -62,8 +74,8 @@ func getJwksURL() string {
 	return issuer + "/.well-known/openid-configuration"
 }
 
-func fetchJWKS() ([]jwkKey, error) {
-	discoveryURL := getJwksURL()
+func fetchJWKS(issuer string) ([]jwkKey, error) {
+	discoveryURL := getJwksURL(issuer)
 	if discoveryURL == "" {
 		return nil, fmt.Errorf("AUTHENTIK_ISSUER not configured")
 	}
@@ -76,6 +88,9 @@ func fetchJWKS() ([]jwkKey, error) {
 		return nil, fmt.Errorf("fetch discovery: %w", err)
 	}
 	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		return nil, fmt.Errorf("discovery returned status %d", resp.StatusCode)
+	}
 
 	var discovery struct {
 		JWKSUri string `json:"jwks_uri"`
@@ -94,6 +109,9 @@ func fetchJWKS() ([]jwkKey, error) {
 		return nil, fmt.Errorf("fetch JWKS: %w", err)
 	}
 	defer jwksResp.Body.Close()
+	if jwksResp.StatusCode != http.StatusOK {
+		return nil, fmt.Errorf("JWKS returned status %d", jwksResp.StatusCode)
+	}
 
 	var jwks jwksResponse
 	if err := json.NewDecoder(jwksResp.Body).Decode(&jwks); err != nil {
@@ -103,7 +121,7 @@ func fetchJWKS() ([]jwkKey, error) {
 	return jwks.Keys, nil
 }
 
-func getKeys() ([]jwkKey, error) {
+func getKeys(issuer string) ([]jwkKey, error) {
 	jwksMu.Lock()
 	defer jwksMu.Unlock()
 
@@ -111,11 +129,8 @@ func getKeys() ([]jwkKey, error) {
 		return jwksKeys, nil
 	}
 
-	keys, err := fetchJWKS()
+	keys, err := fetchJWKS(issuer)
 	if err != nil {
-		if len(jwksKeys) > 0 {
-			return jwksKeys, nil
-		}
 		return nil, err
 	}
 
@@ -143,128 +158,224 @@ func rsaPublicKeyFromJWK(key jwkKey) (*rsa.PublicKey, error) {
 	return &rsa.PublicKey{N: n, E: e}, nil
 }
 
-// AuthMiddleware validates the Authorization Bearer token against Authentik JWKS.
+// AuthMiddleware preserves the existing entry point for tests/embedders while
+// main uses AuthMiddlewareWithOptions with validated configuration.
 func AuthMiddleware(next http.Handler) http.Handler {
-	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		// Skip auth for health endpoint
-		if r.URL.Path == "/health" {
-			next.ServeHTTP(w, r)
-			return
-		}
+	return AuthMiddlewareWithOptions(AuthOptions{
+		Issuer: os.Getenv("AUTHENTIK_ISSUER"), Audience: os.Getenv("AUTHENTIK_AUDIENCE"),
+		ServiceMaxLifetime: 5 * time.Minute,
+	})(next)
+}
 
-		// API key path for service-to-service and tooling access.
-		// Checked before JWT auth; only active when SERVICE_API_KEY is configured.
-		if apiKey := os.Getenv("SERVICE_API_KEY"); apiKey != "" {
-			if provided := r.Header.Get("X-API-Key"); provided != "" &&
-				subtle.ConstantTimeCompare([]byte(provided), []byte(apiKey)) == 1 {
-				log.Printf("[auth] API key authentication (prefix %.4s...) from %s %s", provided, r.Method, r.URL.Path)
-				ctx := context.WithValue(r.Context(), ContextUserID, "service:api-key")
-				ctx = context.WithValue(ctx, ContextUserEmail, "service@internal")
-				ctx = context.WithValue(ctx, ContextUserName, "Service (API key)")
-				ctx = context.WithValue(ctx, ContextIsAdmin, true)
-				next.ServeHTTP(w, r.WithContext(ctx))
+// AuthMiddlewareWithOptions validates JWT signature, RS256 method, issuer,
+// audience, expiry and required identity claims.
+func AuthMiddlewareWithOptions(options AuthOptions) func(http.Handler) http.Handler {
+	if options.ServiceMaxLifetime <= 0 {
+		options.ServiceMaxLifetime = 5 * time.Minute
+	}
+	return func(next http.Handler) http.Handler {
+		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			// A WebSocket upgrade authenticates with the one-time ticket consumed by
+			// its handler. Ticket issuance remains behind JWT middleware.
+			if r.URL.Path == "/health" || r.URL.Path == "/chat/ws" {
+				next.ServeHTTP(w, r)
 				return
 			}
-		}
 
-		authHeader := r.Header.Get("Authorization")
-		if authHeader == "" || !strings.HasPrefix(authHeader, "Bearer ") {
-			http.Error(w, `{"error":"missing authorization header"}`, http.StatusUnauthorized)
-			return
-		}
-
-		tokenStr := strings.TrimPrefix(authHeader, "Bearer ")
-
-		// Parse token without validation first to get the kid
-		token, _, err := new(jwt.Parser).ParseUnverified(tokenStr, jwt.MapClaims{})
-		if err != nil {
-			http.Error(w, `{"error":"invalid token"}`, http.StatusUnauthorized)
-			return
-		}
-
-		kid, ok := token.Header["kid"].(string)
-		if !ok {
-			http.Error(w, `{"error":"no kid in token"}`, http.StatusUnauthorized)
-			return
-		}
-
-		// Get JWKS keys
-		keys, err := getKeys()
-		if err != nil {
-			log.Printf("[auth] failed to get JWKS keys: %v", err)
-			http.Error(w, `{"error":"auth service unavailable"}`, http.StatusInternalServerError)
-			return
-		}
-
-		// Find the matching key
-		var matchingKey *jwkKey
-		for _, k := range keys {
-			if k.Kid == kid {
-				matchingKey = &k
-				break
+			// API key path for service-to-service and tooling access.
+			// Checked before JWT auth; only active when SERVICE_API_KEY is configured.
+			if apiKey := os.Getenv("SERVICE_API_KEY"); apiKey != "" {
+				if provided := r.Header.Get("X-API-Key"); provided != "" &&
+					subtle.ConstantTimeCompare([]byte(provided), []byte(apiKey)) == 1 {
+					log.Printf("[auth] service API key authentication from %s %s", r.Method, r.URL.Path)
+					ctx := context.WithValue(r.Context(), ContextUserID, "service:api-key")
+					if companyID := r.Header.Get("X-Company-ID"); companyID != "" {
+						if !isValidCompanyID(companyID) {
+							http.Error(w, `{"error":"invalid company identity"}`, http.StatusUnauthorized)
+							return
+						}
+						ctx = context.WithValue(ctx, ContextCompanyID, companyID)
+					}
+					ctx = context.WithValue(ctx, ContextUserEmail, "service@internal")
+					ctx = context.WithValue(ctx, ContextUserName, "Service (API key)")
+					ctx = context.WithValue(ctx, ContextIsAdmin, true)
+					ctx = context.WithValue(ctx, ContextAuthSource, "service")
+					ctx = context.WithValue(ctx, ContextAuthIssued, time.Now().UTC())
+					ctx = context.WithValue(ctx, ContextAuthExpires, time.Now().UTC().Add(options.ServiceMaxLifetime))
+					next.ServeHTTP(w, r.WithContext(ctx))
+					return
+				}
 			}
-		}
-
-		if matchingKey == nil {
-			http.Error(w, `{"error":"unknown key"}`, http.StatusUnauthorized)
-			return
-		}
-
-		// Build RSA public key from JWK
-		pubKey, err := rsaPublicKeyFromJWK(*matchingKey)
-		if err != nil {
-			log.Printf("[auth] failed to build RSA key: %v", err)
-			http.Error(w, `{"error":"auth error"}`, http.StatusInternalServerError)
-			return
-		}
-
-		// Verify the token
-		parsed, err := jwt.Parse(tokenStr, func(t *jwt.Token) (interface{}, error) {
-			if _, ok := t.Method.(*jwt.SigningMethodRSA); !ok {
-				return nil, fmt.Errorf("unexpected signing method: %v", t.Header["alg"])
+			if options.Issuer == "" || options.Audience == "" {
+				http.Error(w, `{"error":"JWT authentication is not configured"}`, http.StatusServiceUnavailable)
+				return
 			}
-			return pubKey, nil
-		})
-		if err != nil {
-			http.Error(w, `{"error":"invalid token signature"}`, http.StatusUnauthorized)
-			return
-		}
 
-		claims, ok := parsed.Claims.(jwt.MapClaims)
-		if !ok || !parsed.Valid {
-			http.Error(w, `{"error":"invalid claims"}`, http.StatusUnauthorized)
-			return
-		}
+			authHeader := r.Header.Get("Authorization")
+			if authHeader == "" || !strings.HasPrefix(authHeader, "Bearer ") {
+				http.Error(w, `{"error":"missing authorization header"}`, http.StatusUnauthorized)
+				return
+			}
 
-		// Extract claims
-		sub, _ := claims["sub"].(string)
-		email, _ := claims["email"].(string)
-		name, _ := claims["name"].(string)
+			tokenStr := strings.TrimPrefix(authHeader, "Bearer ")
 
-		// Check admin group
-		isAdmin := false
-		if groups, ok := claims["groups"].([]interface{}); ok {
-			for _, g := range groups {
-				if gs, ok := g.(string); ok && gs == "dev2-admins" {
-					isAdmin = true
+			// Parse token without validation first to get the kid
+			token, _, err := new(jwt.Parser).ParseUnverified(tokenStr, jwt.MapClaims{})
+			if err != nil {
+				http.Error(w, `{"error":"invalid token"}`, http.StatusUnauthorized)
+				return
+			}
+			if token.Method.Alg() != jwt.SigningMethodRS256.Alg() {
+				http.Error(w, `{"error":"invalid token method"}`, http.StatusUnauthorized)
+				return
+			}
+
+			kid, ok := token.Header["kid"].(string)
+			if !ok {
+				http.Error(w, `{"error":"no kid in token"}`, http.StatusUnauthorized)
+				return
+			}
+
+			// Get JWKS keys
+			keys, err := getKeys(options.Issuer)
+			if err != nil {
+				log.Printf("[auth] failed to get JWKS keys: %v", err)
+				http.Error(w, `{"error":"auth service unavailable"}`, http.StatusServiceUnavailable)
+				return
+			}
+
+			// Find the matching key
+			var matchingKey *jwkKey
+			for _, k := range keys {
+				if k.Kid == kid && k.Kty == "RSA" && k.Alg == "RS256" && (k.Use == "" || k.Use == "sig") {
+					matchingKey = &k
 					break
 				}
 			}
+
+			if matchingKey == nil {
+				http.Error(w, `{"error":"unknown key"}`, http.StatusUnauthorized)
+				return
+			}
+
+			// Build RSA public key from JWK
+			pubKey, err := rsaPublicKeyFromJWK(*matchingKey)
+			if err != nil {
+				log.Printf("[auth] failed to build RSA key: %v", err)
+				http.Error(w, `{"error":"auth error"}`, http.StatusInternalServerError)
+				return
+			}
+
+			// Verify the token
+			parsed, claims, err := validateJWT(tokenStr, pubKey, options.Issuer, options.Audience, time.Now())
+			if err != nil {
+				http.Error(w, `{"error":"invalid token"}`, http.StatusUnauthorized)
+				return
+			}
+			if !parsed.Valid {
+				http.Error(w, `{"error":"invalid claims"}`, http.StatusUnauthorized)
+				return
+			}
+
+			// Extract claims
+			sub, _ := claims["sub"].(string)
+			if strings.TrimSpace(sub) == "" {
+				http.Error(w, `{"error":"missing subject"}`, http.StatusUnauthorized)
+				return
+			}
+			email, _ := claims["email"].(string)
+			name, _ := claims["name"].(string)
+			companyID, _ := claims["companyId"].(string)
+			if companyID == "" {
+				companyID, _ = claims["company_id"].(string)
+			}
+			if companyID != "" {
+				if !isValidCompanyID(companyID) {
+					http.Error(w, `{"error":"invalid company identity"}`, http.StatusUnauthorized)
+					return
+				}
+			}
+			expiresAt, err := claims.GetExpirationTime()
+			if err != nil || expiresAt == nil {
+				http.Error(w, `{"error":"missing token expiry"}`, http.StatusUnauthorized)
+				return
+			}
+			issuedAt, _ := claims.GetIssuedAt()
+
+			// Check admin group
+			isAdmin := false
+			if groups, ok := claims["groups"].([]interface{}); ok {
+				for _, g := range groups {
+					if gs, ok := g.(string); ok && gs == "dev2-admins" {
+						isAdmin = true
+						break
+					}
+				}
+			}
+
+			// Set claims on context
+			ctx := context.WithValue(r.Context(), ContextUserID, sub)
+			if companyID != "" {
+				ctx = context.WithValue(ctx, ContextCompanyID, companyID)
+			}
+			ctx = context.WithValue(ctx, ContextUserEmail, email)
+			ctx = context.WithValue(ctx, ContextUserName, name)
+			ctx = context.WithValue(ctx, ContextIsAdmin, isAdmin)
+			ctx = context.WithValue(ctx, ContextAuthSource, "jwt")
+			ctx = context.WithValue(ctx, ContextAuthExpires, expiresAt.Time.UTC())
+			if issuedAt != nil {
+				ctx = context.WithValue(ctx, ContextAuthIssued, issuedAt.Time.UTC())
+			}
+
+			next.ServeHTTP(w, r.WithContext(ctx))
+		})
+	}
+}
+
+func validateJWT(token string, key any, issuer, audience string, now time.Time) (*jwt.Token, jwt.MapClaims, error) {
+	claims := jwt.MapClaims{}
+	parsed, err := jwt.ParseWithClaims(token, claims, func(t *jwt.Token) (any, error) {
+		if t.Method != jwt.SigningMethodRS256 {
+			return nil, fmt.Errorf("unexpected signing method %s", t.Method.Alg())
 		}
+		return key, nil
+	}, jwt.WithValidMethods([]string{"RS256"}), jwt.WithIssuer(issuer), jwt.WithAudience(audience),
+		jwt.WithExpirationRequired(), jwt.WithIssuedAt(), jwt.WithTimeFunc(func() time.Time { return now }))
+	if err != nil {
+		return nil, nil, err
+	}
+	subject, err := claims.GetSubject()
+	if err != nil || strings.TrimSpace(subject) == "" {
+		return nil, nil, errors.New("missing subject")
+	}
+	return parsed, claims, nil
+}
 
-		// Set claims on context
-		ctx := context.WithValue(r.Context(), ContextUserID, sub)
-		ctx = context.WithValue(ctx, ContextUserEmail, email)
-		ctx = context.WithValue(ctx, ContextUserName, name)
-		ctx = context.WithValue(ctx, ContextIsAdmin, isAdmin)
+func isValidCompanyID(value string) bool {
+	parsed, err := uuid.Parse(value)
+	return err == nil && parsed.String() == strings.ToLower(value)
+}
 
-		next.ServeHTTP(w, r.WithContext(ctx))
-	})
+func requestWithSocketIdentity(ctx context.Context, identity models.SocketIdentity) *http.Request {
+	ctx = context.WithValue(ctx, ContextUserID, identity.UserID)
+	ctx = context.WithValue(ctx, ContextCompanyID, identity.CompanyID)
+	ctx = context.WithValue(ctx, ContextIsAdmin, identity.IsAdmin)
+	req, _ := http.NewRequestWithContext(ctx, http.MethodGet, "http://socket.internal/", nil)
+	return req
 }
 
 // GetUserID extracts the authenticated user ID from the request context.
 func GetUserID(r *http.Request) string {
 	if v, ok := r.Context().Value(ContextUserID).(string); ok {
+		return v
+	}
+	return ""
+}
+
+// GetCompanyID extracts a company identity when the authentication provider
+// includes one. Not all service/admin tokens are bound to a single company.
+func GetCompanyID(r *http.Request) string {
+	if v, ok := r.Context().Value(ContextCompanyID).(string); ok {
 		return v
 	}
 	return ""
@@ -276,4 +387,19 @@ func GetIsAdmin(r *http.Request) bool {
 		return v
 	}
 	return false
+}
+
+func GetAuthExpiresAt(r *http.Request) time.Time {
+	value, _ := r.Context().Value(ContextAuthExpires).(time.Time)
+	return value
+}
+
+func GetAuthSource(r *http.Request) string {
+	value, _ := r.Context().Value(ContextAuthSource).(string)
+	return value
+}
+
+func GetAuthIssuedAt(r *http.Request) time.Time {
+	value, _ := r.Context().Value(ContextAuthIssued).(time.Time)
+	return value
 }

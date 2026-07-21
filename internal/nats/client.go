@@ -1,9 +1,11 @@
 package nats
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"log"
+	"sync"
 	"time"
 
 	"github.com/Dev2dot-Solutions/dev2-chat/internal/models"
@@ -16,12 +18,27 @@ const (
 	SubjectLLMRequest         = "llm.request"
 	SubjectChatSessionCreated = "chat.session.created"
 	SubjectChatMessageSent    = "chat.message.sent"
+	SubjectCompanyProjectsGet = "company.projects.get"
+	SubjectToolApprove        = "tool.approve"
+	SubjectToolAudit          = "audit.tool.invocation"
+	companyProjectsCacheTTL   = 60 * time.Second
+	toolApproveTimeout        = 10 * time.Second
+	cancelReadinessWait       = 5 * time.Second
+	cancelFlushTimeout        = 2 * time.Second
 )
 
 // Client manages NATS connections for dev2-chat.
 type Client struct {
 	nc  *nats.Conn
 	enc *nats.EncodedConn
+
+	projectsMu    sync.Mutex
+	projectsCache map[string]cachedProjects
+}
+
+type cachedProjects struct {
+	projects []models.CompanyProject
+	expires  time.Time
 }
 
 // NewClient creates a new NATS client. If nc is nil, all operations are no-ops.
@@ -52,10 +69,21 @@ func (c *Client) RequestKnowledgeSearch(req *models.KnowledgeSearchRequest) (*mo
 
 // RequestLLM sends a NATS request-reply to dev2-llm-service for completion.
 func (c *Client) RequestLLM(req *models.LLMRequest) (*models.LLMResponse, error) {
-	if c.enc == nil {
+	return c.RequestLLMWithProgress(context.Background(), req, nil)
+}
+
+// RequestLLMWithProgress sends an LLM request while forwarding safe progress
+// metadata from a unique inbox. The progress subscription is active before
+// the request is published and is always removed when the final reply,
+// cancellation, or timeout is observed.
+func (c *Client) RequestLLMWithProgress(ctx context.Context, req *models.LLMRequest, onProgress func(models.ToolTraceEvent)) (*models.LLMResponse, error) {
+	if c.nc == nil {
 		return nil, fmt.Errorf("NATS not connected")
 	}
-	sessionID := fmt.Sprintf("chat-%d", time.Now().UnixNano())
+	sessionID := req.SessionID
+	if sessionID == "" {
+		sessionID = fmt.Sprintf("chat-%d", time.Now().UnixNano())
+	}
 
 	// Build a NATSRequest-compatible payload
 	// Extract system prompt from messages
@@ -81,18 +109,202 @@ func (c *Client) RequestLLM(req *models.LLMRequest) (*models.LLMResponse, error)
 		}
 	}
 
+	progressSubject := nats.NewInbox()
+	cancelSubject := nats.NewInbox()
+	progressMessages := make(chan *nats.Msg, 64)
+	progressSub, err := c.nc.ChanSubscribe(progressSubject, progressMessages)
+	if err != nil {
+		return nil, fmt.Errorf("subscribe to llm progress: %w", err)
+	}
+	progressOwned := true
+	defer func() {
+		if progressOwned {
+			progressSub.Unsubscribe()
+		}
+	}()
+	// Flush guarantees the server has registered the inbox before llm.request
+	// can emit its first progress event.
+	if err := c.nc.FlushTimeout(5 * time.Second); err != nil {
+		return nil, fmt.Errorf("subscribe to llm progress: %w", err)
+	}
+
 	natsReq := map[string]interface{}{
 		"sessionId":           sessionID,
+		"userId":              req.UserID,
 		"systemPrompt":        systemPrompt,
 		"conversationHistory": history,
 		"latestMessage":       latestMessage,
 		"modelOverride":       req.Model,
+		"accessProfile":       req.AccessProfile,
+		"workspaceCompanyId":  req.WorkspaceCompanyID,
+		"workspaceProjectId":  req.WorkspaceProjectID,
+		"progressSubject":     progressSubject,
+		"cancelSubject":       cancelSubject,
+	}
+	// Forward the session's access profile and workspace scoping so
+	// dev2-llm-service can gate its own tools and resolve personas.
+	if req.WorkspacePTProjectKey != "" {
+		natsReq["workspacePtProjectKey"] = req.WorkspacePTProjectKey
 	}
 
-	var resp models.LLMResponse
-	err := c.enc.Request(fmt.Sprintf("%s.%s", SubjectLLMRequest, sessionID), natsReq, &resp, 120*time.Second)
+	payload, err := json.Marshal(natsReq)
 	if err != nil {
-		return nil, fmt.Errorf("llm.request failed: %w", err)
+		return nil, fmt.Errorf("marshal llm.request: %w", err)
+	}
+
+	requestCtx, cancel := context.WithTimeout(ctx, 120*time.Second)
+	defer cancel()
+	type requestResult struct {
+		msg *nats.Msg
+		err error
+	}
+	resultCh := make(chan requestResult, 1)
+	go func() {
+		msg, requestErr := c.nc.RequestWithContext(requestCtx, fmt.Sprintf("%s.%s", SubjectLLMRequest, sessionID), payload)
+		resultCh <- requestResult{msg: msg, err: requestErr}
+	}()
+	cancellation := newRequestCancellationState(func() {
+		if err := c.nc.Publish(cancelSubject, []byte(`{}`)); err != nil {
+			log.Printf("[nats] Failed to publish llm cancellation: %v", err)
+		}
+		if err := c.nc.FlushTimeout(cancelFlushTimeout); err != nil {
+			log.Printf("[nats] Failed to flush llm cancellation: %v", err)
+		}
+	})
+	handoffCancellation := func() {
+		if cancellation.requestCancel() {
+			return
+		}
+		// The HTTP request may now return, but this goroutine owns the progress
+		// subscription until request_started arrives or the bounded wait ends.
+		progressOwned = false
+		go func() {
+			defer progressSub.Unsubscribe()
+			readyCtx, readyCancel := context.WithTimeout(context.Background(), cancelReadinessWait)
+			defer readyCancel()
+			awaitRequestStarted(readyCtx, progressMessages, cancellation)
+		}()
+	}
+
+	forwardProgress := func(msg *nats.Msg) {
+		var event models.ToolTraceEvent
+		if err := json.Unmarshal(msg.Data, &event); err != nil {
+			log.Printf("[nats] Ignoring invalid llm progress event: %v", err)
+			return
+		}
+		if isRequestStarted(event.Type) {
+			cancellation.observeReady()
+		}
+		if onProgress != nil {
+			onProgress(event)
+		}
+	}
+
+	for {
+		select {
+		case msg := <-progressMessages:
+			forwardProgress(msg)
+		case result := <-resultCh:
+			if requestCtx.Err() != nil {
+				handoffCancellation()
+				return nil, fmt.Errorf("llm.request failed: %w", requestCtx.Err())
+			}
+			// The NATS connection dispatches messages in wire order. Drain any
+			// progress already delivered before processing the final reply.
+			for {
+				select {
+				case msg := <-progressMessages:
+					forwardProgress(msg)
+				default:
+					if requestCtx.Err() != nil {
+						handoffCancellation()
+						return nil, fmt.Errorf("llm.request failed: %w", requestCtx.Err())
+					}
+					if result.err != nil {
+						if ctx.Err() != nil || requestCtx.Err() != nil {
+							handoffCancellation()
+						}
+						return nil, fmt.Errorf("llm.request failed: %w", result.err)
+					}
+					var resp models.LLMResponse
+					if err := json.Unmarshal(result.msg.Data, &resp); err != nil {
+						return nil, fmt.Errorf("decode llm.request response: %w", err)
+					}
+					return &resp, nil
+				}
+			}
+		case <-requestCtx.Done():
+			handoffCancellation()
+			return nil, fmt.Errorf("llm.request failed: %w", requestCtx.Err())
+		}
+	}
+}
+
+// RequestCompanyProjects fetches the company's Dev2Projects from
+// dev2-company-config via company.projects.get request-reply. Results are
+// cached briefly (60s) since project/visibility changes are infrequent.
+func (c *Client) RequestCompanyProjects(companyID string) ([]models.CompanyProject, error) {
+	return c.requestCompanyProjects(companyID, false)
+}
+
+// RequestCompanyProjectsFresh bypasses the short project cache for
+// authorization decisions made on an already-open WebSocket.
+func (c *Client) RequestCompanyProjectsFresh(companyID string) ([]models.CompanyProject, error) {
+	return c.requestCompanyProjects(companyID, true)
+}
+
+func (c *Client) requestCompanyProjects(companyID string, fresh bool) ([]models.CompanyProject, error) {
+	if c.enc == nil {
+		return nil, fmt.Errorf("NATS not connected")
+	}
+
+	if !fresh {
+		c.projectsMu.Lock()
+		if cp, ok := c.projectsCache[companyID]; ok && time.Now().Before(cp.expires) {
+			c.projectsMu.Unlock()
+			return cp.projects, nil
+		}
+		c.projectsMu.Unlock()
+	}
+
+	var resp struct {
+		CompanyID string                  `json:"companyId"`
+		Projects  []models.CompanyProject `json:"projects"`
+		Error     string                  `json:"error,omitempty"`
+	}
+	err := c.enc.Request(SubjectCompanyProjectsGet,
+		map[string]string{"companyId": companyID}, &resp, 5*time.Second)
+	if err != nil {
+		return nil, fmt.Errorf("company.projects.get request failed: %w", err)
+	}
+	if resp.Error != "" {
+		return nil, fmt.Errorf("company.projects.get: %s", resp.Error)
+	}
+
+	c.projectsMu.Lock()
+	if c.projectsCache == nil {
+		c.projectsCache = make(map[string]cachedProjects)
+	}
+	c.projectsCache[companyID] = cachedProjects{
+		projects: resp.Projects,
+		expires:  time.Now().Add(companyProjectsCacheTTL),
+	}
+	c.projectsMu.Unlock()
+	return resp.Projects, nil
+}
+
+// RequestToolApproval forwards an approval decision to dev2-llm-service via
+// tool.approve request-reply (DEV2-108). Session and user identity must
+// already be resolved from the authenticated session — never from the HTTP
+// request body.
+func (c *Client) RequestToolApproval(req *models.ToolApprovalRequest) (*models.ToolApprovalResponse, error) {
+	if c.enc == nil {
+		return nil, fmt.Errorf("NATS not connected")
+	}
+	var resp models.ToolApprovalResponse
+	err := c.enc.Request(SubjectToolApprove, req, &resp, toolApproveTimeout)
+	if err != nil {
+		return nil, fmt.Errorf("tool.approve request failed: %w", err)
 	}
 	return &resp, nil
 }
@@ -106,8 +318,8 @@ func (c *Client) PublishSessionCreated(session *models.ChatSession) {
 		"sessionId": session.ID,
 		"companyId": session.CompanyID,
 		"userId":    session.UserID,
-		"title":      session.Title,
-		"timestamp":  time.Now().UTC().Format(time.RFC3339),
+		"title":     session.Title,
+		"timestamp": time.Now().UTC().Format(time.RFC3339),
 	}
 	if err := c.enc.Publish(SubjectChatSessionCreated, event); err != nil {
 		log.Printf("[nats] Failed to publish session.created: %v", err)
@@ -123,12 +335,29 @@ func (c *Client) PublishMessageSent(sessionID, companyID, userID, role, content 
 		"sessionId":      sessionID,
 		"companyId":      companyID,
 		"userId":         userID,
-		"role":            role,
+		"role":           role,
 		"contentPreview": truncate(content, 200),
-		"timestamp":       time.Now().UTC().Format(time.RFC3339),
+		"timestamp":      time.Now().UTC().Format(time.RFC3339),
 	}
 	if err := c.enc.Publish(SubjectChatMessageSent, event); err != nil {
 		log.Printf("[nats] Failed to publish message.sent: %v", err)
+	}
+}
+
+// PublishToolInvocation publishes a local-tool audit event. NATS Publish is
+// asynchronous; callers also invoke this method in a goroutine so auditing can
+// never delay or fail a chat tool execution.
+func (c *Client) PublishToolInvocation(event models.ToolAuditEvent) {
+	if c.nc == nil {
+		return
+	}
+	payload, err := json.Marshal(event)
+	if err != nil {
+		log.Printf("[nats] Failed to marshal tool audit event: %v", err)
+		return
+	}
+	if err := c.nc.Publish(SubjectToolAudit, payload); err != nil {
+		log.Printf("[nats] Failed to publish tool audit event: %v", err)
 	}
 }
 

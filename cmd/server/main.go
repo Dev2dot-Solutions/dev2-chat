@@ -55,6 +55,9 @@ func main() {
 			"user_id":         "userId",
 			"session_id":      "sessionId",
 			"conversation_id": "conversationId",
+			"request_id":      "requestId",
+			"access_profile":  "accessProfile",
+			"project_id":      "projectId",
 			"token_count":     "tokenCount",
 			"message_count":   "messageCount",
 			"tool_calls":      "toolCalls",
@@ -72,6 +75,11 @@ func main() {
 	// Repositories
 	sessionRepo := repository.NewSessionRepo(mongoDB)
 	messageRepo := repository.NewMessageRepo(mongoDB)
+	approvalRepo := repository.NewApprovalRepo(mongoDB)
+	socketRepo := repository.NewSocketRepo(mongoDB)
+	if err := socketRepo.EnsureIndexes(ctx); err != nil {
+		log.Fatalf("Failed to create socket indexes: %v", err)
+	}
 	knowledgeRepo := repository.NewKnowledgeRepo(mongoDB)
 	settingsRepo := repository.NewSettingsRepo(mongoDB)
 
@@ -102,34 +110,48 @@ func main() {
 		ticketsClient,
 		ptClient,
 		settingsRepo.GetPTConfig,
+		natsClient,
 	)
 
 	// Handlers
-	chatHandler := handlers.NewChatHandler(sessionRepo, messageRepo)
+	chatHandler := handlers.NewChatHandler(sessionRepo, messageRepo, approvalRepo, natsClient)
 	agentHandler := handlers.NewAgentHandler(
-		sessionRepo, messageRepo, knowledgeRepo,
+		sessionRepo, messageRepo, approvalRepo, knowledgeRepo,
 		llmClient, natsClient, toolExecutor,
 		cfg.LLMModel, cfg.LLMProvider,
 	)
+	chatHandler.SetAgentHandler(agentHandler)
 	settingsHandler := handlers.NewSettingsHandler(settingsRepo)
+	socketHandler := handlers.NewSocketHandler(socketRepo, agentHandler, chatHandler, handlers.SocketOptions{
+		AllowedOrigins: cfg.SocketAllowedOrigins, TrustedProxyCIDRs: cfg.SocketTrustedProxyCIDRs,
+		RequireTrustedProxy: cfg.SocketRequireTrustedProxy,
+		SendQueue:           cfg.SocketSendQueue, ReadLimit: cfg.SocketReadLimit,
+		PingInterval: cfg.SocketPingInterval, IdleTimeout: cfg.SocketIdleTimeout,
+		MaxLifetime: cfg.SocketMaxLifetime, DeveloperMaxLifetime: cfg.SocketDeveloperMaxLifetime,
+		ServiceMaxLifetime: cfg.SocketServiceMaxLifetime,
+		TicketPolicy:       repository.TicketPolicy{IssuePerMinute: cfg.SocketTicketRate, MaxOutstanding: cfg.SocketOutstandingTickets},
+		ConnectionPolicy: repository.ConnectionPolicy{
+			GlobalLimit: cfg.SocketConnectionsGlobal, CompanyLimit: cfg.SocketConnectionsCompany,
+			UserLimit: cfg.SocketConnectionsUser, IPLimit: cfg.SocketConnectionsIP, LeaseTTL: cfg.SocketConnectionLeaseTTL,
+		},
+		GenerationPolicy: repository.GenerationPolicy{
+			GlobalLimit: cfg.SocketGenerationsGlobal, CompanyLimit: cfg.SocketGenerationsCompany,
+			UserLimit: cfg.SocketGenerationsUser, LeaseTTL: cfg.SocketGenerationLeaseTTL,
+		},
+		MessagesPerMinute: cfg.SocketMessagesPerMinute, MessageBurst: cfg.SocketMessageBurst,
+		MessageRatePolicy: repository.MessageRatePolicy{
+			UserPerMinute: cfg.SocketMessagesUser, CompanyPerMinute: cfg.SocketMessagesCompany, IPPerMinute: cfg.SocketMessagesIP,
+		},
+		HandshakeRate: cfg.SocketHandshakeRate, HandshakeBurst: cfg.SocketHandshakeBurst,
+	})
 
 	// Router
 	r := chi.NewRouter()
 	r.Use(chimw.RequestID)
+	r.Use(handlers.PeerIPMiddleware)
 	r.Use(chimw.RealIP)
 	r.Use(chimw.Logger)
 	r.Use(chimw.Recoverer)
-	r.Use(cors.Handler(cors.Options{
-		// Allow all origins — the frontend is served from a different domain.
-		AllowedOrigins:   []string{"*"},
-		AllowedMethods:   []string{"GET", "POST", "PATCH", "DELETE", "OPTIONS"},
-		AllowedHeaders:   []string{"Accept", "Authorization", "Content-Type"},
-		ExposedHeaders:   []string{"Link"},
-		AllowCredentials: true,
-		MaxAge:           300,
-	}))
-	// WebSocket-aware timeout: skip timeout on WS upgrade paths so SSE
-	// streams and chat connections aren't killed by the global timeout.
 	r.Use(func(next http.Handler) http.Handler {
 		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 			if r.URL.Path == "/chat/ws" {
@@ -139,7 +161,18 @@ func main() {
 			chimw.Timeout(30*time.Second)(next).ServeHTTP(w, r)
 		})
 	})
-	r.Use(handlers.AuthMiddleware)
+	r.Use(cors.Handler(cors.Options{
+		AllowedOrigins:   cfg.AllowedOrigins,
+		AllowedMethods:   []string{"GET", "POST", "PATCH", "DELETE", "OPTIONS"},
+		AllowedHeaders:   []string{"Accept", "Authorization", "Content-Type"},
+		ExposedHeaders:   []string{"Link"},
+		AllowCredentials: true,
+		MaxAge:           300,
+	}))
+	r.Use(handlers.AuthMiddlewareWithOptions(handlers.AuthOptions{
+		Issuer: cfg.AuthentikIssuer, Audience: cfg.AuthentikAudience,
+		ServiceMaxLifetime: cfg.SocketServiceMaxLifetime,
+	}))
 
 	// Health
 	r.Get("/health", func(w http.ResponseWriter, r *http.Request) {
@@ -150,8 +183,8 @@ func main() {
 
 	// Register routes
 	chatHandler.Routes(r)
-	agentHandler.Routes(r)
 	settingsHandler.Routes(r)
+	socketHandler.Routes(r)
 
 	// Server
 	addr := fmt.Sprintf(":%d", cfg.Port)

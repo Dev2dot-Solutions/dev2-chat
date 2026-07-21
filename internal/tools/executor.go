@@ -4,16 +4,20 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"strconv"
+	"time"
 
 	"github.com/Dev2dot-Solutions/dev2-chat/internal/models"
+	"github.com/google/uuid"
 )
 
 // Executor routes tool calls from the LLM to the appropriate handler.
 type Executor struct {
-	knowledgeRepo KnowledgeProvider
-	ticketsClient TicketsClient
-	ptClient      PtClientProvider
-	ptConfigFn    func(ctx context.Context, companyID string) (*models.PtConfig, error)
+	knowledgeRepo  KnowledgeProvider
+	ticketsClient  TicketsClient
+	ptClient       PtClientProvider
+	ptConfigFn     func(ctx context.Context, companyID string) (*models.PtConfig, error)
+	auditPublisher AuditPublisher
 }
 
 // KnowledgeProvider interface for knowledge graph lookups.
@@ -25,10 +29,15 @@ type KnowledgeProvider interface {
 
 // TicketsClient interface for ticket operations (calls dev2-tickets via HTTP).
 type TicketsClient interface {
-	CreateTicket(ctx context.Context, companyID, title, description, ticketType, createdBy string, priority int) (map[string]any, error)
+	CreateTicket(ctx context.Context, companyID, title, description, ticketType, createdBy string, priority int, attribution models.TicketAttribution) (map[string]any, error)
 	GetTicket(ctx context.Context, ticketID string) (map[string]any, error)
 	ListTickets(ctx context.Context, companyID string, status, ticketType, assignedTo, search string, limit int) ([]map[string]any, error)
 	AddComment(ctx context.Context, ticketID, authorID, body string) (map[string]any, error)
+}
+
+// AuditPublisher emits local tool invocation audit events.
+type AuditPublisher interface {
+	PublishToolInvocation(event models.ToolAuditEvent)
 }
 
 // PtClientProvider interface for Project Tracker operations.
@@ -40,18 +49,82 @@ type PtClientProvider interface {
 }
 
 // NewExecutor creates a new tool executor.
-func NewExecutor(kr KnowledgeProvider, tc TicketsClient, ptc PtClientProvider, ptFn func(ctx context.Context, companyID string) (*models.PtConfig, error)) *Executor {
+func NewExecutor(kr KnowledgeProvider, tc TicketsClient, ptc PtClientProvider, ptFn func(ctx context.Context, companyID string) (*models.PtConfig, error), auditPublisher AuditPublisher) *Executor {
 	return &Executor{
-		knowledgeRepo: kr,
-		ticketsClient: tc,
-		ptClient:      ptc,
-		ptConfigFn:    ptFn,
+		knowledgeRepo:  kr,
+		ticketsClient:  tc,
+		ptClient:       ptc,
+		ptConfigFn:     ptFn,
+		auditPublisher: auditPublisher,
 	}
 }
 
-// ToolDefinitions returns all tools the LLM can call.
-func (e *Executor) ToolDefinitions() []models.ToolDefinition {
-	return []models.ToolDefinition{
+// ExecContext carries per-session scoping for a tool execution.
+type ExecContext struct {
+	CompanyID string
+	UserID    string
+	SessionID string
+	ProjectID string
+	// AccessProfile is the session's access profile ("client"|"developer").
+	AccessProfile string
+	// PTProjectKey overrides the company-default PT project key when the
+	// session is bound to a Dev2Project with a projectTrackerKey.
+	PTProjectKey string
+	// PersonaName is intentionally empty today: dev2-chat does not resolve the
+	// active llm-service persona and must not fabricate one for audit events.
+	PersonaName string
+}
+
+// profileToolsets maps each access profile to the local tools it may use —
+// both advertised to the LLM and permitted at dispatch (defense in depth).
+//
+//	client:    knowledge search/entity, ticket create + list/get (own
+//	           company), PT create/read/search in the bound project
+//	developer: all of the above plus ticket comments, PT updates, and the
+//	           requirements/deviation tools once they land (see note)
+var profileToolsets = map[string]map[string]bool{
+	models.AccessProfileClient: {
+		"search_knowledge": true,
+		"get_entity":       true,
+		"create_ticket":    true,
+		"get_ticket":       true,
+		"list_tickets":     true,
+		"create_pt_item":   true,
+		"read_pt_item":     true,
+		"search_pt":        true,
+	},
+	models.AccessProfileDeveloper: {
+		"search_knowledge": true,
+		"get_entity":       true,
+		"create_ticket":    true,
+		"get_ticket":       true,
+		"list_tickets":     true,
+		"add_comment":      true,
+		"create_pt_item":   true,
+		"read_pt_item":     true,
+		"search_pt":        true,
+		"update_pt_item":   true,
+		// Reserved, developer-only: requirements capture and deviation
+		// reporting tools are not implemented in dev2-chat yet; when added
+		// they are gated to the developer profile here.
+		"record_requirement": true,
+		"report_deviation":   true,
+	},
+}
+
+// ProfileAllows reports whether the profile may advertise and execute the
+// named tool. Unknown profiles fail closed.
+func ProfileAllows(profile, toolName string) bool {
+	set, ok := profileToolsets[profile]
+	return ok && set[toolName]
+}
+
+// ToolDefinitions returns the tools the LLM can call for the given access
+// profile. The profile is normalized (empty/unknown → client, fail closed)
+// and any tool outside the profile's set is not advertised.
+func (e *Executor) ToolDefinitions(profile string) []models.ToolDefinition {
+	p := models.NormalizeAccessProfile(profile)
+	all := []models.ToolDefinition{
 		{
 			Type: "function",
 			Function: models.ToolFunction{
@@ -60,7 +133,7 @@ func (e *Executor) ToolDefinitions() []models.ToolDefinition {
 				Parameters: map[string]any{
 					"type": "object",
 					"properties": map[string]any{
-						"query":      map[string]any{"type": "string", "description": "Search query"},
+						"query":     map[string]any{"type": "string", "description": "Search query"},
 						"companyId": map[string]any{"type": "string", "format": "uuid"},
 					},
 					"required": []string{"query", "companyId"},
@@ -75,8 +148,8 @@ func (e *Executor) ToolDefinitions() []models.ToolDefinition {
 				Parameters: map[string]any{
 					"type": "object",
 					"properties": map[string]any{
-						"type":       map[string]any{"type": "string", "enum": []string{"conventions", "business_rules", "domain_terms", "architecture_decisions", "processes", "functions", "classes", "files", "tickets"}},
-						"id":         map[string]any{"type": "string", "format": "uuid"},
+						"type":      map[string]any{"type": "string", "enum": []string{"conventions", "business_rules", "domain_terms", "architecture_decisions", "processes", "functions", "classes", "files", "tickets"}},
+						"id":        map[string]any{"type": "string", "format": "uuid"},
 						"companyId": map[string]any{"type": "string", "format": "uuid"},
 					},
 					"required": []string{"type", "id", "companyId"},
@@ -91,12 +164,12 @@ func (e *Executor) ToolDefinitions() []models.ToolDefinition {
 				Parameters: map[string]any{
 					"type": "object",
 					"properties": map[string]any{
-						"companyId":  map[string]any{"type": "string", "format": "uuid"},
+						"companyId":   map[string]any{"type": "string", "format": "uuid"},
 						"title":       map[string]any{"type": "string"},
 						"description": map[string]any{"type": "string"},
 						"type":        map[string]any{"type": "string", "enum": []string{"bug", "feature", "task", "improvement"}},
 						"priority":    map[string]any{"type": "integer", "minimum": 1, "maximum": 5},
-						"createdBy":  map[string]any{"type": "string", "format": "uuid"},
+						"createdBy":   map[string]any{"type": "string", "format": "uuid"},
 					},
 					"required": []string{"companyId", "title", "description", "createdBy"},
 				},
@@ -125,11 +198,11 @@ func (e *Executor) ToolDefinitions() []models.ToolDefinition {
 					"type": "object",
 					"properties": map[string]any{
 						"companyId":  map[string]any{"type": "string", "format": "uuid"},
-						"status":      map[string]any{"type": "string", "enum": []string{"open", "in_progress", "resolved", "closed"}},
-						"type":        map[string]any{"type": "string", "enum": []string{"bug", "feature", "task", "improvement"}},
+						"status":     map[string]any{"type": "string", "enum": []string{"open", "in_progress", "resolved", "closed"}},
+						"type":       map[string]any{"type": "string", "enum": []string{"bug", "feature", "task", "improvement"}},
 						"assignedTo": map[string]any{"type": "string", "format": "uuid"},
-						"search":      map[string]any{"type": "string"},
-						"limit":       map[string]any{"type": "integer", "maximum": 50},
+						"search":     map[string]any{"type": "string"},
+						"limit":      map[string]any{"type": "integer", "maximum": 50},
 					},
 					"required": []string{"companyId"},
 				},
@@ -145,7 +218,7 @@ func (e *Executor) ToolDefinitions() []models.ToolDefinition {
 					"properties": map[string]any{
 						"ticketId": map[string]any{"type": "string", "format": "uuid"},
 						"authorId": map[string]any{"type": "string", "format": "uuid"},
-						"body":      map[string]any{"type": "string"},
+						"body":     map[string]any{"type": "string"},
 					},
 					"required": []string{"ticketId", "authorId", "body"},
 				},
@@ -159,7 +232,7 @@ func (e *Executor) ToolDefinitions() []models.ToolDefinition {
 				Parameters: map[string]any{
 					"type": "object",
 					"properties": map[string]any{
-						"companyId":  map[string]any{"type": "string", "format": "uuid"},
+						"companyId":   map[string]any{"type": "string", "format": "uuid"},
 						"type":        map[string]any{"type": "string", "enum": []string{"story", "task"}},
 						"title":       map[string]any{"type": "string"},
 						"description": map[string]any{"type": "string"},
@@ -194,7 +267,7 @@ func (e *Executor) ToolDefinitions() []models.ToolDefinition {
 					"type": "object",
 					"properties": map[string]any{
 						"companyId": map[string]any{"type": "string", "format": "uuid"},
-						"query":      map[string]any{"type": "string"},
+						"query":     map[string]any{"type": "string"},
 					},
 					"required": []string{"companyId", "query"},
 				},
@@ -208,8 +281,8 @@ func (e *Executor) ToolDefinitions() []models.ToolDefinition {
 				Parameters: map[string]any{
 					"type": "object",
 					"properties": map[string]any{
-						"companyId":    map[string]any{"type": "string", "format": "uuid"},
-						"itemKey":      map[string]any{"type": "string"},
+						"companyId":     map[string]any{"type": "string", "format": "uuid"},
+						"itemKey":       map[string]any{"type": "string"},
 						"status":        map[string]any{"type": "string", "enum": []string{"backlog", "todo", "in_progress", "review", "done", "blocked"}},
 						"priority":      map[string]any{"type": "string", "enum": []string{"low", "medium", "high", "critical"}},
 						"blockedReason": map[string]any{"type": "string"},
@@ -219,24 +292,68 @@ func (e *Executor) ToolDefinitions() []models.ToolDefinition {
 			},
 		},
 	}
+	filtered := make([]models.ToolDefinition, 0, len(all))
+	for _, def := range all {
+		if ProfileAllows(p, def.Function.Name) {
+			filtered = append(filtered, def)
+		}
+	}
+	return filtered
 }
 
 // Execute runs a single tool call and returns the result as a JSON string.
-func (e *Executor) Execute(ctx context.Context, toolCall models.LLMToolCall, companyID, userID string) string {
+// Tools outside the session's access profile are rejected at dispatch even if
+// the LLM hallucinates them (defense in depth — they were never advertised).
+func (e *Executor) Execute(ctx context.Context, toolCall models.LLMToolCall, exec ExecContext) (result string) {
+	started := time.Now()
+	auditArguments := toolCall.Function.Arguments
+	defer func() {
+		if e.auditPublisher == nil {
+			return
+		}
+		errMsg := auditResultError(result)
+		event := models.ToolAuditEvent{
+			EventID:       uuid.NewString(),
+			Timestamp:     started.UTC(),
+			CompanyID:     truncateAuditValue(exec.CompanyID, maxAuditIdentityBytes),
+			ProjectID:     truncateAuditValue(exec.ProjectID, maxAuditIdentityBytes),
+			UserID:        truncateAuditValue(exec.UserID, maxAuditIdentityBytes),
+			SessionID:     truncateAuditValue(exec.SessionID, maxAuditIdentityBytes),
+			AccessProfile: models.NormalizeAccessProfile(exec.AccessProfile),
+			PersonaName:   truncateAuditValue(exec.PersonaName, maxAuditNameBytes),
+			ToolName:      truncateAuditValue(toolCall.Function.Name, maxAuditNameBytes),
+			Arguments:     redactAuditArguments(auditArguments),
+			Result:        truncateAuditValue(redactAuditResult(result), maxAuditResultBytes),
+			Error:         truncateAuditValue(errMsg, maxAuditErrorBytes),
+			LatencyMS:     strconv.FormatInt(time.Since(started).Milliseconds(), 10),
+			Success:       errMsg == "",
+		}
+		go e.auditPublisher.PublishToolInvocation(event)
+	}()
+
+	profile := models.NormalizeAccessProfile(exec.AccessProfile)
+	if !ProfileAllows(profile, toolCall.Function.Name) {
+		return jsonError(fmt.Sprintf("tool %q is not available for the %s profile", toolCall.Function.Name, profile))
+	}
+
 	var args map[string]any
 	if err := json.Unmarshal([]byte(toolCall.Function.Arguments), &args); err != nil {
 		return jsonError("failed to parse arguments: " + err.Error())
 	}
 
-	// Inject context
-	if _, ok := args["companyId"]; !ok && companyID != "" {
-		args["companyId"] = companyID
+	// Inject context — the session's company always wins over anything the
+	// LLM supplies, keeping the company boundary intact.
+	if exec.CompanyID != "" {
+		args["companyId"] = exec.CompanyID
 	}
-	if _, ok := args["createdBy"]; !ok && userID != "" && toolCall.Function.Name == "create_ticket" {
-		args["createdBy"] = userID
+	if exec.UserID != "" && toolCall.Function.Name == "create_ticket" {
+		args["createdBy"] = exec.UserID
 	}
-	if _, ok := args["authorId"]; !ok && userID != "" && toolCall.Function.Name == "add_comment" {
-		args["authorId"] = userID
+	if exec.UserID != "" && toolCall.Function.Name == "add_comment" {
+		args["authorId"] = exec.UserID
+	}
+	if effectiveArgs, err := json.Marshal(args); err == nil {
+		auditArguments = string(effectiveArgs)
 	}
 
 	switch toolCall.Function.Name {
@@ -245,7 +362,7 @@ func (e *Executor) Execute(ctx context.Context, toolCall models.LLMToolCall, com
 	case "get_entity":
 		return e.execGetEntity(ctx, args)
 	case "create_ticket":
-		return e.execCreateTicket(ctx, args)
+		return e.execCreateTicket(ctx, exec, args)
 	case "get_ticket":
 		return e.execGetTicket(ctx, args)
 	case "list_tickets":
@@ -253,13 +370,13 @@ func (e *Executor) Execute(ctx context.Context, toolCall models.LLMToolCall, com
 	case "add_comment":
 		return e.execAddComment(ctx, args)
 	case "create_pt_item":
-		return e.execCreatePtItem(ctx, args)
+		return e.execCreatePtItem(ctx, exec, args)
 	case "read_pt_item":
-		return e.execReadPtItem(ctx, args)
+		return e.execReadPtItem(ctx, exec, args)
 	case "search_pt":
-		return e.execSearchPt(ctx, args)
+		return e.execSearchPt(ctx, exec, args)
 	case "update_pt_item":
-		return e.execUpdatePtItem(ctx, args)
+		return e.execUpdatePtItem(ctx, exec, args)
 	default:
 		return jsonError(fmt.Sprintf("unknown tool: %s", toolCall.Function.Name))
 	}
@@ -302,7 +419,7 @@ func (e *Executor) execGetEntity(ctx context.Context, args map[string]any) strin
 
 // ── Ticket Tools ────────────────────────────────────────────────────────────
 
-func (e *Executor) execCreateTicket(ctx context.Context, args map[string]any) string {
+func (e *Executor) execCreateTicket(ctx context.Context, exec ExecContext, args map[string]any) string {
 	companyID, _ := args["companyId"].(string)
 	title, _ := args["title"].(string)
 	description, _ := args["description"].(string)
@@ -317,7 +434,12 @@ func (e *Executor) execCreateTicket(ctx context.Context, args map[string]any) st
 		return jsonError("companyId, title, and createdBy are required")
 	}
 
-	result, err := e.ticketsClient.CreateTicket(ctx, companyID, title, description, ticketType, createdBy, priority)
+	result, err := e.ticketsClient.CreateTicket(ctx, companyID, title, description, ticketType, createdBy, priority, models.TicketAttribution{
+		Origin:          models.NormalizeAccessProfile(exec.AccessProfile),
+		SourceUserID:    exec.UserID,
+		SourceSessionID: exec.SessionID,
+		SourceProjectID: exec.ProjectID,
+	})
 	if err != nil {
 		return jsonError("create ticket failed: " + err.Error())
 	}
@@ -327,6 +449,7 @@ func (e *Executor) execCreateTicket(ctx context.Context, args map[string]any) st
 
 func (e *Executor) execGetTicket(ctx context.Context, args map[string]any) string {
 	ticketID, _ := args["ticketId"].(string)
+	companyID, _ := args["companyId"].(string)
 	if ticketID == "" {
 		return jsonError("ticketId is required")
 	}
@@ -337,6 +460,13 @@ func (e *Executor) execGetTicket(ctx context.Context, args map[string]any) strin
 	}
 	if result == nil {
 		return jsonError("ticket not found")
+	}
+	// Company boundary: never leak another company's ticket, even if the LLM
+	// guesses a foreign ticket ID.
+	if companyID != "" {
+		if cid, ok := result["companyId"].(string); ok && cid != "" && cid != companyID {
+			return jsonError("ticket not found")
+		}
 	}
 	data, _ := json.Marshal(result)
 	return string(data)
@@ -383,20 +513,35 @@ func (e *Executor) execAddComment(ctx context.Context, args map[string]any) stri
 
 // ── Project Tracker Tools ───────────────────────────────────────────────────
 
-func (e *Executor) execCreatePtItem(ctx context.Context, args map[string]any) string {
-	companyID, _ := args["companyId"].(string)
+// resolvePTConfig loads the company's PT config and applies the session
+// project's bound projectTrackerKey (when set) over the company default.
+func (e *Executor) resolvePTConfig(ctx context.Context, exec ExecContext) (*models.PtConfig, string) {
+	ptConfig, err := e.ptConfigFn(ctx, exec.CompanyID)
+	if err != nil || ptConfig == nil {
+		return nil, "PT not configured — set up your PT token in settings"
+	}
+	if exec.PTProjectKey != "" {
+		override := *ptConfig
+		override.ProjectKey = exec.PTProjectKey
+		ptConfig = &override
+	}
+	return ptConfig, ""
+}
+
+func (e *Executor) execCreatePtItem(ctx context.Context, exec ExecContext, args map[string]any) string {
 	title, _ := args["title"].(string)
 	description, _ := args["description"].(string)
 	itemType, _ := args["type"].(string)
 	priority, _ := args["priority"].(string)
+	companyID := exec.CompanyID
 
 	if companyID == "" || title == "" {
 		return jsonError("companyId and title are required")
 	}
 
-	ptConfig, err := e.ptConfigFn(ctx, companyID)
-	if err != nil || ptConfig == nil {
-		return jsonError("PT not configured — set up your PT token in settings")
+	ptConfig, errMsg := e.resolvePTConfig(ctx, exec)
+	if ptConfig == nil {
+		return jsonError(errMsg)
 	}
 
 	if itemType == "" {
@@ -434,26 +579,53 @@ func (e *Executor) execCreatePtItem(ctx context.Context, args map[string]any) st
 			}
 		}
 	}
+	// Origin label: PT items created via chat carry source:client or
+	// source:developer so the origin flow is traceable in the tracker.
+	originLabel := "source:" + models.NormalizeAccessProfile(exec.AccessProfile)
+	alreadyHas := false
+	for _, l := range labels {
+		if l == originLabel {
+			alreadyHas = true
+			break
+		}
+	}
+	if !alreadyHas {
+		labels = append(labels, originLabel)
+	}
 	item.Labels = labels
 
 	result, err := e.ptClient.CreateItem(ptConfig.Token, ptConfig.ProjectKey, item)
 	if err != nil {
 		return jsonError("create PT item failed: " + err.Error())
 	}
+	if result == nil || result.Key == "" {
+		return jsonError("PT item created but response did not include an item key for attribution")
+	}
+	attribution := fmt.Sprintf(
+		"Created via Dev2 %s chat by user %s, conversation %s, Dev2Project %s.",
+		models.NormalizeAccessProfile(exec.AccessProfile), exec.UserID, exec.SessionID, attributionProjectID(exec.ProjectID),
+	)
+	createdKey := result.Key
+	updated, err := e.ptClient.UpdateItem(ptConfig.Token, createdKey, map[string]any{"changeLog": attribution})
+	if err != nil {
+		return jsonError(fmt.Sprintf("PT item %s created but attribution changeLog failed: %s", createdKey, err.Error()))
+	}
+	if updated != nil {
+		result = updated
+	}
 	data, _ := json.Marshal(result)
 	return string(data)
 }
 
-func (e *Executor) execReadPtItem(ctx context.Context, args map[string]any) string {
-	companyID, _ := args["companyId"].(string)
+func (e *Executor) execReadPtItem(ctx context.Context, exec ExecContext, args map[string]any) string {
 	itemKey, _ := args["itemKey"].(string)
-	if companyID == "" || itemKey == "" {
+	if exec.CompanyID == "" || itemKey == "" {
 		return jsonError("companyId and itemKey are required")
 	}
 
-	ptConfig, err := e.ptConfigFn(ctx, companyID)
-	if err != nil || ptConfig == nil {
-		return jsonError("PT not configured")
+	ptConfig, errMsg := e.resolvePTConfig(ctx, exec)
+	if ptConfig == nil {
+		return jsonError(errMsg)
 	}
 
 	result, err := e.ptClient.GetItem(ptConfig.Token, itemKey)
@@ -464,16 +636,15 @@ func (e *Executor) execReadPtItem(ctx context.Context, args map[string]any) stri
 	return string(data)
 }
 
-func (e *Executor) execSearchPt(ctx context.Context, args map[string]any) string {
-	companyID, _ := args["companyId"].(string)
+func (e *Executor) execSearchPt(ctx context.Context, exec ExecContext, args map[string]any) string {
 	query, _ := args["query"].(string)
-	if companyID == "" || query == "" {
+	if exec.CompanyID == "" || query == "" {
 		return jsonError("companyId and query are required")
 	}
 
-	ptConfig, err := e.ptConfigFn(ctx, companyID)
-	if err != nil || ptConfig == nil {
-		return jsonError("PT not configured")
+	ptConfig, errMsg := e.resolvePTConfig(ctx, exec)
+	if ptConfig == nil {
+		return jsonError(errMsg)
 	}
 
 	items, err := e.ptClient.SearchItems(ptConfig.Token, query)
@@ -484,16 +655,15 @@ func (e *Executor) execSearchPt(ctx context.Context, args map[string]any) string
 	return string(data)
 }
 
-func (e *Executor) execUpdatePtItem(ctx context.Context, args map[string]any) string {
-	companyID, _ := args["companyId"].(string)
+func (e *Executor) execUpdatePtItem(ctx context.Context, exec ExecContext, args map[string]any) string {
 	itemKey, _ := args["itemKey"].(string)
-	if companyID == "" || itemKey == "" {
+	if exec.CompanyID == "" || itemKey == "" {
 		return jsonError("companyId and itemKey are required")
 	}
 
-	ptConfig, err := e.ptConfigFn(ctx, companyID)
-	if err != nil || ptConfig == nil {
-		return jsonError("PT not configured")
+	ptConfig, errMsg := e.resolvePTConfig(ctx, exec)
+	if ptConfig == nil {
+		return jsonError(errMsg)
 	}
 
 	changes := make(map[string]any)

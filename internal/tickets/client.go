@@ -7,6 +7,8 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+
+	"github.com/Dev2dot-Solutions/dev2-chat/internal/models"
 )
 
 // Client handles HTTP calls to the dev2-tickets service.
@@ -19,7 +21,7 @@ func NewClient(baseURL string) *Client {
 	return &Client{baseURL: baseURL, http: &http.Client{}}
 }
 
-func (c *Client) doRequest(method, path string, body any) ([]byte, error) {
+func (c *Client) doRequest(ctx context.Context, method, path string, body any) ([]byte, error) {
 	var reqBody io.Reader
 	if body != nil {
 		data, err := json.Marshal(body)
@@ -29,7 +31,7 @@ func (c *Client) doRequest(method, path string, body any) ([]byte, error) {
 		reqBody = bytes.NewReader(data)
 	}
 	url := c.baseURL + path
-	req, err := http.NewRequest(method, url, reqBody)
+	req, err := http.NewRequestWithContext(ctx, method, url, reqBody)
 	if err != nil {
 		return nil, fmt.Errorf("create request: %w", err)
 	}
@@ -49,9 +51,11 @@ func (c *Client) doRequest(method, path string, body any) ([]byte, error) {
 	return respBody, nil
 }
 
-func (c *Client) CreateTicket(ctx context.Context, companyID, title, description, ticketType, createdBy string, priority int) (map[string]any, error) {
+func (c *Client) CreateTicket(ctx context.Context, companyID, title, description, ticketType, createdBy string, priority int, attribution models.TicketAttribution) (map[string]any, error) {
 	body := map[string]any{
 		"companyId": companyID, "title": title, "createdBy": createdBy,
+		"origin": attribution.Origin, "sourceUserId": attribution.SourceUserID,
+		"sourceSessionId": attribution.SourceSessionID, "sourceProjectId": attribution.SourceProjectID,
 	}
 	if description != "" {
 		body["description"] = description
@@ -62,7 +66,7 @@ func (c *Client) CreateTicket(ctx context.Context, companyID, title, description
 	if priority > 0 {
 		body["priority"] = priority
 	}
-	respBody, err := c.doRequest("POST", "/tickets", body)
+	respBody, err := c.doRequest(ctx, "POST", "/tickets", body)
 	if err != nil {
 		return nil, err
 	}
@@ -74,7 +78,7 @@ func (c *Client) CreateTicket(ctx context.Context, companyID, title, description
 }
 
 func (c *Client) GetTicket(ctx context.Context, ticketID string) (map[string]any, error) {
-	respBody, err := c.doRequest("GET", "/tickets/"+ticketID, nil)
+	respBody, err := c.doRequest(ctx, "GET", "/tickets/"+ticketID, nil)
 	if err != nil {
 		return nil, err
 	}
@@ -102,7 +106,7 @@ func (c *Client) ListTickets(ctx context.Context, companyID, status, ticketType,
 	if limit > 0 {
 		path += fmt.Sprintf("&limit=%d", limit)
 	}
-	respBody, err := c.doRequest("GET", path, nil)
+	respBody, err := c.doRequest(ctx, "GET", path, nil)
 	if err != nil {
 		return nil, err
 	}
@@ -117,7 +121,7 @@ func (c *Client) ListTickets(ctx context.Context, companyID, status, ticketType,
 
 func (c *Client) AddComment(ctx context.Context, ticketID, authorID, body string) (map[string]any, error) {
 	reqBody := map[string]any{"authorId": authorID, "body": body}
-	respBody, err := c.doRequest("POST", "/tickets/"+ticketID+"/comments", reqBody)
+	respBody, err := c.doRequest(ctx, "POST", "/tickets/"+ticketID+"/comments", reqBody)
 	if err != nil {
 		return nil, err
 	}
