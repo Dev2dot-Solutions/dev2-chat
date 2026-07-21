@@ -154,13 +154,29 @@ func buildSessionListFilter(companyID, userID, accessProfile string, clientProje
 		bson.M{"accessProfile": ""},
 		bson.M{"accessProfile": bson.M{"$exists": false}},
 	}}
-	clientProject := bson.M{"$or": bson.A{
-		bson.M{"projectId": bson.M{"$in": clientProjectIDs}},
+	// Build the project filter: always include unbound/legacy sessions
+	// (empty or missing projectId), and only add $in when authorized
+	// project IDs are present to avoid an invalid empty-array query.
+	clientProjectClauses := bson.A{
 		bson.M{"projectId": ""},
 		bson.M{"projectId": bson.M{"$exists": false}},
-	}}
+	}
+	if len(clientProjectIDs) > 0 {
+		clientProjectClauses = append(bson.A{bson.M{"projectId": bson.M{"$in": clientProjectIDs}}}, clientProjectClauses...)
+	}
+	clientProject := bson.M{"$or": clientProjectClauses}
 	clientCondition := bson.M{"$and": bson.A{clientProfile, clientProject}}
-	developerCondition := bson.M{"accessProfile": models.AccessProfileDeveloper, "projectId": bson.M{"$in": developerProjectIDs}}
+
+	// Developer sessions require a specific authorized project.
+	// When the list is empty, use an impossible match ($in: null)
+	// instead of $in: [] which causes a query error in some drivers.
+	var developerCondition bson.M
+	if len(developerProjectIDs) > 0 {
+		developerCondition = bson.M{"accessProfile": models.AccessProfileDeveloper, "projectId": bson.M{"$in": developerProjectIDs}}
+	} else {
+		developerCondition = bson.M{"_id": bson.M{"$exists": false}} // always false — _id always exists
+	}
+
 	switch {
 	case accessProfile == models.AccessProfileClient:
 		filter["$and"] = clientCondition["$and"]
