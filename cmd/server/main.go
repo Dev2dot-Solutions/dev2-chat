@@ -173,6 +173,9 @@ func main() {
 		Issuer: cfg.AuthentikIssuer, Audience: cfg.AuthentikAudience,
 		ServiceMaxLifetime: cfg.SocketServiceMaxLifetime,
 	}))
+	if cfg.AuthentikIssuer == "" || cfg.AuthentikAudience == "" {
+		log.Printf("[auth] WARNING: AUTHENTIK_ISSUER and/or AUTHENTIK_AUDIENCE not set — JWT-authenticated routes will return 503 (SERVICE_API_KEY auth still works)")
+	}
 
 	// Health
 	r.Get("/health", func(w http.ResponseWriter, r *http.Request) {
